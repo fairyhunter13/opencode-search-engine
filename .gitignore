@@ -1,0 +1,19 @@
+# Rust
+indexer/target/
+
+# Python
+embedder/__pycache__/
+embedder/build/
+embedder/dist/
+embedder/*.egg-info/
+embedder/.venv/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
