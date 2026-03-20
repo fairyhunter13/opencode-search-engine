@@ -714,6 +714,77 @@ pub fn relative_path_with_symlinks(
     file.to_string_lossy().to_string()
 }
 
+
+/// Global cache for submodule discovery results keyed by project root.
+fn submodule_cache() -> &'static RwLock<HashMap<PathBuf, Vec<(PathBuf, String)>>> {
+    static CACHE: OnceLock<RwLock<HashMap<PathBuf, Vec<(PathBuf, String)>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Discover git submodules in the given project root.
+///
+/// Runs `git submodule status --recursive` and parses the output.
+/// Returns `(absolute_path, name)` pairs. Results are cached globally.
+pub fn discover_submodules(root: &Path) -> Vec<(PathBuf, String)> {
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    if let Ok(read) = submodule_cache().read() {
+        if let Some(cached) = read.get(&key) {
+            return cached.clone();
+        }
+    }
+
+    let result = run_discover_submodules(root);
+
+    if let Ok(mut write) = submodule_cache().write() {
+        write.insert(key, result.clone());
+    }
+
+    result
+}
+
+fn run_discover_submodules(root: &Path) -> Vec<(PathBuf, String)> {
+    let output = std::process::Command::new("git")
+        .args(["submodule", "status", "--recursive"])
+        .current_dir(root)
+        .output();
+
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut results = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim_start_matches(|c: char| c == ' ' || c == '+' || c == '-' || c == 'U');
+        // format: <hash> <path> (<branch>)  OR  <hash> <path>
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let sub_rel = parts[1].trim();
+        if sub_rel.is_empty() {
+            continue;
+        }
+        let abs = match root.join(sub_rel).canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let name = PathBuf::from(sub_rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(sub_rel)
+            .to_string();
+        results.push((abs, name));
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod config_discovery_tests {
     use super::*;
@@ -1275,3 +1346,72 @@ mod config_discovery_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod submodule_tests {
+    use super::*;
+
+    #[test]
+    fn discover_submodules_empty_when_none() {
+        // A directory with no submodules should return empty vec
+        let dir = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init failed");
+        let result = run_discover_submodules(dir.path());
+        assert!(result.is_empty(), "no submodules → empty result");
+    }
+
+    #[test]
+    fn discover_submodules_non_git_dir_returns_empty() {
+        // A plain directory (not a git repo) should return empty, not panic
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = run_discover_submodules(dir.path());
+        assert!(result.is_empty(), "non-git dir → empty result");
+    }
+
+    #[test]
+    fn discover_submodules_finds_submodule() {
+        // Create parent repo with a submodule
+        let base = tempfile::TempDir::new().unwrap();
+        let parent = base.path().join("parent");
+        let sub = base.path().join("sub_repo");
+
+        // Create sub repo
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("lib.rs"), "// lib").unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(&sub).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.email", "t@t.com"]).current_dir(&sub).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.name", "T"]).current_dir(&sub).output().unwrap();
+        std::process::Command::new("git").args(["add", "-A"]).current_dir(&sub).output().unwrap();
+        std::process::Command::new("git").args(["commit", "-m", "init"]).current_dir(&sub).output().unwrap();
+
+        // Create parent repo
+        std::fs::create_dir_all(&parent).unwrap();
+        std::process::Command::new("git").args(["init"]).current_dir(&parent).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.email", "t@t.com"]).current_dir(&parent).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.name", "T"]).current_dir(&parent).output().unwrap();
+        std::process::Command::new("git").args(["write-tree"]).current_dir(&parent).output().unwrap();
+
+        // Add submodule
+        let out = std::process::Command::new("git")
+            .args(["submodule", "add", sub.to_str().unwrap(), "vendor/sub_repo"])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+
+        if !out.status.success() {
+            // Skip test if git submodule add fails (e.g. CI restrictions)
+            eprintln!("git submodule add failed, skipping: {}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+
+        let result = run_discover_submodules(&parent);
+        assert_eq!(result.len(), 1, "should find one submodule");
+        assert_eq!(result[0].1, "sub_repo", "name should be last path component");
+        assert!(result[0].0.ends_with("sub_repo"), "path should end with sub_repo");
+    }
+}
+

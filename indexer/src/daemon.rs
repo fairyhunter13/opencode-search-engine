@@ -2541,6 +2541,28 @@ fn discover_links_impl(root: &str) -> Result<serde_json::Value> {
         }));
     }
 
+    // Also detect git submodules as linked projects
+    let submodules = discover::discover_submodules(&root);
+    for (sub_path, name) in &submodules {
+        // Skip if already found as a symlink-based link
+        if links.iter().any(|l| l["path"].as_str() == Some(sub_path.to_str().unwrap_or(""))) {
+            continue;
+        }
+        // Skip repos marked with skip: true in .opencode-index.yaml
+        if project.linked.get(name).map(|l| l.skip).unwrap_or(false) {
+            continue;
+        }
+        let id = storage::git_project_id(sub_path);
+        let db = storage::storage_path(sub_path);
+        links.push(serde_json::json!({
+            "path": sub_path.to_str().unwrap_or(""),
+            "projectId": id,
+            "name": name,
+            "dbPath": db.to_str().unwrap_or(""),
+            "submodule": true,
+        }));
+    }
+
     Ok(serde_json::json!({
         "rootProjectId": storage::git_project_id(&root),
         "links": links,
@@ -3143,13 +3165,14 @@ async fn start_project_memory_watchers(
 }
 
 /// Start an internal watcher for a project (runs within daemon, no external process)
-async fn watcher_start_internal(
-    state: &Arc<tokio::sync::Mutex<DaemonState>>,
-    root: &str,
-    db: Option<&str>,
-    tier: Option<&str>,
+fn watcher_start_internal<'a>(
+    state: &'a Arc<tokio::sync::Mutex<DaemonState>>,
+    root: &'a str,
+    db: Option<&'a str>,
+    tier: Option<&'a str>,
     _force: bool,
-) -> Result<serde_json::Value, anyhow::Error> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, anyhow::Error>> + Send + 'a>> {
+    Box::pin(async move {
     // Use consistent fallback pattern for canonicalization (matches watcher_stop, watcher_status, etc.)
     // This ensures HashMap keys are consistent even when path can't be canonicalized.
     let root_path = tokio::fs::canonicalize(root).await.unwrap_or_else(|_| PathBuf::from(root));
@@ -3402,6 +3425,45 @@ async fn watcher_start_internal(
             }
         });
     }
+    // After linked project indexing, start watchers for linked projects via dispatch_unified.
+    // Using dispatch_unified (not watcher_start_internal directly) avoids recursive async
+    // type inference issues that make tokio::spawn require Send.
+    {
+        let root_for_links = root.to_string();
+        let tier_for_links = tier.to_string();
+        let state_for_links = state.clone();
+        tokio::spawn(async move {
+            // Wait for indexing to complete (2s init + indexing time + buffer)
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Collect (repo, db) pairs synchronously; filter by existing index
+            let pairs: Vec<(String, String)> = tokio::task::spawn_blocking({
+                let root = root_for_links.clone();
+                move || {
+                    cached_discover_links(&root)
+                        .into_iter()
+                        .filter(|l| l.db.join("chunks.lance").exists())
+                        .map(|l| (l.repo.to_string_lossy().to_string(), l.db.to_string_lossy().to_string()))
+                        .collect()
+                }
+            })
+            .await
+            .unwrap_or_default();
+            for (repo, db) in pairs {
+                let result = dispatch_unified(
+                    state_for_links.clone(),
+                    "watcher_start".to_string(),
+                    serde_json::json!({ "root": repo, "db": db, "tier": tier_for_links }),
+                ).await;
+                if result["started"].as_bool().unwrap_or(false) {
+                    tracing::info!("started watcher for linked project: {}", db);
+                } else if result["message"].as_str() == Some("already_watching") {
+                    tracing::debug!("watcher already running for linked project: {}", db);
+                } else if result["success"].as_bool() == Some(false) {
+                    tracing::debug!("watcher_start for linked project {}: {:?}", db, result);
+                }
+            }
+        });
+    }
 
     // Start project memory and activity watchers in background
     // Extract project_id from root path for memory/activity directories
@@ -3424,6 +3486,7 @@ async fn watcher_start_internal(
         "internal": true,
         "dbPath": db_path.to_string_lossy(),
     }))
+    })
 }
 
 /// Stop an internal watcher for a project
