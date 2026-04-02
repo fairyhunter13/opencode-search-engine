@@ -110,16 +110,19 @@ exe = EXE(
 # This drastically reduces binary size (from 1.9GB+ to ~200MB) and build time (from 15min to <1min)
 # At runtime, set LD_LIBRARY_PATH=/opt/rocm/lib to use system GPU libraries.
 #
-# IMPORTANT: We exclude EVERYTHING GPU-related including:
+# IMPORTANT: We exclude ROCm/MIGraphX-specific GPU libraries including:
 # - onnxruntime providers (libonnxruntime_providers_rocm.so, libonnxruntime_providers_migraphx.so)
 # - All ROCm libraries (libamdhip64, librocblas, etc.)
 # - All MIGraphX libraries (libmigraphx, etc.)
-# The CPU provider will work without these, and GPU provider works via system libs.
+# We KEEP libonnxruntime_providers_shared.so — it is required by ALL GPU providers
+# (CUDA, TensorRT, ROCm, MIGraphX). CUDA/TensorRT use bundled ONNX libs + system CUDA.
 ROCM_EXCLUDE_PATTERNS = [
-    # ONNX Runtime GPU providers - use system libs
+    # ONNX Runtime GPU providers - use system libs for ROCm/MIGraphX
     'libonnxruntime_providers_rocm',
     'libonnxruntime_providers_migraphx',
-    'libonnxruntime_providers_shared',
+    # NOTE: libonnxruntime_providers_shared MUST stay bundled — it is required
+    # by ALL GPU providers (CUDA, TensorRT, ROCm, MIGraphX). Without it,
+    # ONNX Runtime falls back to CPUExecutionProvider even when GPU libs exist.
     # HIP runtime and libraries
     'libamdhip64',
     'libhipblas',       # All hipblas variants
