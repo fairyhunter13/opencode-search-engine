@@ -1221,8 +1221,8 @@ def _gpu_provider_options(provider: str) -> list[dict]:
         # TensorRT manages its own memory via trt_max_workspace_size;
         # arena_extend_strategy / gpu_mem_limit are CUDA EP options.
         opts: dict = {
-            "trt_fp16_enable": "1" if caps.get("supports_fp16") else "0",
-            "trt_engine_cache_enable": "1",
+            "trt_fp16_enable": "True" if caps.get("supports_fp16") else "False",
+            "trt_engine_cache_enable": "True",
             "trt_engine_cache_path": "/tmp/trt_cache",
             "trt_max_workspace_size": str(2 * 1024 * 1024 * 1024),  # 2GB
         }
