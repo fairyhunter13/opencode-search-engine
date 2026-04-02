@@ -1220,10 +1220,16 @@ def _gpu_provider_options(provider: str) -> list[dict]:
     if provider == "TensorrtExecutionProvider":
         # TensorRT manages its own memory via trt_max_workspace_size;
         # arena_extend_strategy / gpu_mem_limit are CUDA EP options.
+        # Use persistent cache dir so TRT engines survive reboots (~3s cold start saved)
+        cache = os.path.join(os.path.expanduser("~"), ".cache", "opencode", "trt_cache")
+        os.makedirs(cache, exist_ok=True)
         opts: dict = {
             "trt_fp16_enable": "True" if caps.get("supports_fp16") else "False",
             "trt_engine_cache_enable": "True",
-            "trt_engine_cache_path": "/tmp/trt_cache",
+            "trt_engine_cache_path": cache,
+            # Timing cache persists kernel autotuning results across engine builds
+            "trt_timing_cache_enable": "True",
+            "trt_timing_cache_path": cache,
             "trt_max_workspace_size": str(2 * 1024 * 1024 * 1024),  # 2GB
         }
         # For Blackwell (SM 12.0+), enable additional optimizations
@@ -1237,6 +1243,9 @@ def _gpu_provider_options(provider: str) -> list[dict]:
             **base,
             "cudnn_conv_algo_search": "EXHAUSTIVE",
             "do_copy_in_default_stream": "1",
+            # CUDA Graphs capture and replay GPU command sequences,
+            # eliminating kernel launch overhead (~10-20% latency reduction)
+            "enable_cuda_graph": "1",
         }
         # Blackwell (SM 12.0+) benefits from NHWC layout for better tensor core utilization
         cc = caps.get("compute_capability")
