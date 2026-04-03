@@ -1,4 +1,4 @@
-//! HTTP server for the indexer daemon (transport-layer alternative to Unix socket).
+//! HTTP server for the indexer daemon.
 //!
 //! Exposes two endpoints:
 //!   POST /rpc   — {"method": "...", "params": {...}} → {"result": ...}
@@ -7,7 +7,11 @@
 //! The bound port is written to ~/.opencode/indexer.port so clients can
 //! discover it without knowing the port in advance.
 
-use axum::{Json, Router, extract::State, routing::{get, post}};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::Value;
 
 use crate::daemon::Dispatcher;
