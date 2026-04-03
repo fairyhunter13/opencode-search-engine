@@ -151,7 +151,7 @@ impl PendingChanges {
             notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
-    
+
     /// Add changed files and notify processor
     fn add_changed(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
@@ -160,7 +160,7 @@ impl PendingChanges {
         }
         self.notify.notify_one();
     }
-    
+
     /// Add deleted files and notify processor
     fn add_deleted(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
@@ -169,22 +169,22 @@ impl PendingChanges {
         }
         self.notify.notify_one();
     }
-    
+
     /// Drain all pending changes, returns (changed, deleted)
     fn drain(&mut self) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let changed = self.changed.drain().collect();
         let deleted = self.deleted.drain().collect();
         (changed, deleted)
     }
-    
+
     fn is_empty(&self) -> bool {
         self.changed.is_empty() && self.deleted.is_empty()
     }
-    
+
     fn len(&self) -> usize {
         self.changed.len() + self.deleted.len()
     }
-    
+
     /// Get a clone of the notify handle for waiting without holding the lock
     fn notify_handle(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.notify)
@@ -365,7 +365,12 @@ impl CompactionState {
     }
 
     /// Check if compaction should be triggered based on idle time and threshold.
-    fn should_compact(&self, idle_threshold: Duration, ops_threshold: u64, force_threshold: u64) -> bool {
+    fn should_compact(
+        &self,
+        idle_threshold: Duration,
+        ops_threshold: u64,
+        force_threshold: u64,
+    ) -> bool {
         if self.compact_in_progress {
             return false;
         }
@@ -387,7 +392,8 @@ impl CompactionState {
 /// Compaction configuration (can be overridden via environment variables).
 fn compaction_idle_threshold() -> Duration {
     static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| env_duration_ms("OPENCODE_COMPACTION_IDLE_MS", Duration::from_secs(30)))
+    *THRESHOLD
+        .get_or_init(|| env_duration_ms("OPENCODE_COMPACTION_IDLE_MS", Duration::from_secs(30)))
 }
 
 fn compaction_ops_threshold() -> u64 {
@@ -412,12 +418,22 @@ fn compaction_force_threshold() -> u64 {
 
 fn compaction_check_interval() -> Duration {
     static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *INTERVAL.get_or_init(|| env_duration_ms("OPENCODE_COMPACTION_CHECK_INTERVAL_MS", Duration::from_secs(300)))
+    *INTERVAL.get_or_init(|| {
+        env_duration_ms(
+            "OPENCODE_COMPACTION_CHECK_INTERVAL_MS",
+            Duration::from_secs(300),
+        )
+    })
 }
 
 fn compaction_shutdown_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *TIMEOUT.get_or_init(|| env_duration_ms("OPENCODE_COMPACTION_SHUTDOWN_TIMEOUT_MS", Duration::from_secs(60)))
+    *TIMEOUT.get_or_init(|| {
+        env_duration_ms(
+            "OPENCODE_COMPACTION_SHUTDOWN_TIMEOUT_MS",
+            Duration::from_secs(60),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +456,7 @@ async fn compaction_worker(
 ) {
     // Track in-flight compactions to deduplicate
     let mut in_flight: HashSet<String> = HashSet::new();
-    
+
     loop {
         tokio::select! {
             // Non-biased select to prevent busy-loop if channel closes
@@ -457,13 +473,13 @@ async fn compaction_worker(
                     _ => {} // Value is false, continue waiting
                 }
             }
-            
+
             req = rx.recv() => {
                 let Some(req) = req else {
                     tracing::info!("compaction worker channel closed");
                     break;
                 };
-                
+
                 // Skip if already being processed (deduplicate)
                 if in_flight.contains(&req.key) {
                     tracing::trace!(
@@ -472,10 +488,10 @@ async fn compaction_worker(
                     );
                     continue;
                 }
-                
+
                 // Mark as in-flight
                 in_flight.insert(req.key.clone());
-                
+
                 // Update state to mark compaction started
                 {
                     let mut s = state.lock().await;
@@ -483,7 +499,7 @@ async fn compaction_worker(
                         cs.mark_compaction_started();
                     }
                 }
-                
+
                 // Perform compaction (outside of lock)
                 let start = Instant::now();
                 match perform_compaction(&req.db_path, req.dims).await {
@@ -510,13 +526,13 @@ async fn compaction_worker(
                         }
                     }
                 }
-                
+
                 // Remove from in-flight
                 in_flight.remove(&req.key);
             }
         }
     }
-    
+
     tracing::info!("compaction worker shutting down");
 }
 
@@ -534,13 +550,16 @@ fn queue_compaction(
         dims,
         source,
     };
-    
+
     // Use try_send to never block the caller
     if let Err(e) = tx.try_send(req) {
         match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                tracing::warn!("compaction queue full, dropping request for {} (source: {})", 
-                    e.into_inner().db_path.display(), source);
+                tracing::warn!(
+                    "compaction queue full, dropping request for {} (source: {})",
+                    e.into_inner().db_path.display(),
+                    source
+                );
             }
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                 tracing::debug!("compaction queue closed (shutting down)");
@@ -553,9 +572,10 @@ fn queue_compaction(
 /// Call this after successful index_file or remove_file operations.
 fn record_compaction_operation(state: &mut DaemonState, db_path: &Path, dims: u32) {
     let key = db_path.to_string_lossy().to_string();
-    let entry = state.compaction.entry(key).or_insert_with(|| {
-        CompactionState::new(db_path.to_path_buf(), dims)
-    });
+    let entry = state
+        .compaction
+        .entry(key)
+        .or_insert_with(|| CompactionState::new(db_path.to_path_buf(), dims));
     entry.record_operation();
 }
 
@@ -565,20 +585,23 @@ fn record_compaction_operation(state: &mut DaemonState, db_path: &Path, dims: u3
 async fn shutdown_drain_write_queues(state: Arc<Mutex<DaemonState>>) {
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     let start = Instant::now();
-    
+
     // Get all watcher keys
     let keys: Vec<String> = {
         let s = state.lock().await;
         s.watchers.keys().cloned().collect()
     };
-    
+
     if keys.is_empty() {
         tracing::info!("shutdown: no watchers to drain");
         return;
     }
-    
-    tracing::info!("shutdown: draining LanceDB WriteQueues for {} watcher(s)", keys.len());
-    
+
+    tracing::info!(
+        "shutdown: draining LanceDB WriteQueues for {} watcher(s)",
+        keys.len()
+    );
+
     for key in keys {
         // Check timeout
         if start.elapsed() >= DRAIN_TIMEOUT {
@@ -588,20 +611,22 @@ async fn shutdown_drain_write_queues(state: Arc<Mutex<DaemonState>>) {
             );
             break;
         }
-        
+
         // Signal shutdown and drain
         let mut s = state.lock().await;
         if let Some(watcher) = s.watchers.get_mut(&key) {
             // Signal shutdown to watcher
             let _ = watcher.shutdown_tx.send(true);
-            
+
             // Drain WriteQueue
             let remaining = DRAIN_TIMEOUT.saturating_sub(start.elapsed());
             match tokio::time::timeout(remaining, watcher.drain_write_queue()).await {
                 Ok(Some(stats)) => {
                     tracing::info!(
                         "Shutdown: drained LanceDB WriteQueue for {} ({} batches, {} chunks)",
-                        key, stats.batches_written, stats.chunks_written
+                        key,
+                        stats.batches_written,
+                        stats.chunks_written
                     );
                 }
                 Ok(None) => {
@@ -613,9 +638,12 @@ async fn shutdown_drain_write_queues(state: Arc<Mutex<DaemonState>>) {
             }
         }
     }
-    
+
     let elapsed = start.elapsed();
-    tracing::info!("shutdown: all WriteQueue draining completed in {:?}", elapsed);
+    tracing::info!(
+        "shutdown: all WriteQueue draining completed in {:?}",
+        elapsed
+    );
 }
 
 async fn shutdown_compaction(state: Arc<Mutex<DaemonState>>) {
@@ -628,7 +656,14 @@ async fn shutdown_compaction(state: Arc<Mutex<DaemonState>>) {
         s.compaction
             .iter()
             .filter(|(_, cs)| cs.operations_since_compact > 0 && !cs.compact_in_progress)
-            .map(|(k, cs)| (k.clone(), cs.db_path.clone(), cs.dimensions, cs.operations_since_compact))
+            .map(|(k, cs)| {
+                (
+                    k.clone(),
+                    cs.db_path.clone(),
+                    cs.dimensions,
+                    cs.operations_since_compact,
+                )
+            })
             .collect()
     };
 
@@ -698,10 +733,7 @@ async fn shutdown_compaction(state: Arc<Mutex<DaemonState>>) {
         }
     }
 
-    tracing::info!(
-        "shutdown compaction: finished in {:?}",
-        start.elapsed()
-    );
+    tracing::info!("shutdown compaction: finished in {:?}", start.elapsed());
 }
 
 // ---------------------------------------------------------------------------
@@ -733,8 +765,6 @@ fn storage_cache() -> &'static RwLock<HashMap<StorageKey, CachedStorage>> {
 
 use std::time::{Duration, Instant};
 
-
-
 fn env_duration_ms(key: &str, default: Duration) -> Duration {
     let Ok(value) = std::env::var(key) else {
         return default;
@@ -750,7 +780,9 @@ fn env_duration_ms(key: &str, default: Duration) -> Duration {
 
 fn tui_cleanup_interval() -> Duration {
     static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *INTERVAL.get_or_init(|| env_duration_ms("OPENCODE_TUI_CLEANUP_INTERVAL_MS", Duration::from_secs(300)))
+    *INTERVAL.get_or_init(|| {
+        env_duration_ms("OPENCODE_TUI_CLEANUP_INTERVAL_MS", Duration::from_secs(300))
+    })
 }
 
 #[derive(Clone)]
@@ -792,25 +824,27 @@ fn links_cache_path(root: &Path) -> PathBuf {
 /// Returns None if file doesn't exist, is invalid, or has wrong version.
 fn load_links_from_file(root: &Path) -> Option<Vec<Link>> {
     let cache_path = links_cache_path(root);
-    
+
     let content = std::fs::read_to_string(&cache_path).ok()?;
     let persisted: PersistedLinks = serde_json::from_str(&content).ok()?;
-    
+
     // Validate version
     if persisted.version != LINKS_CACHE_VERSION {
         tracing::debug!("links cache version mismatch, invalidating");
         return None;
     }
-    
+
     // Validate root matches
     let root_str = root.to_string_lossy();
     if persisted.project_root != root_str {
         tracing::debug!("links cache root mismatch, invalidating");
         return None;
     }
-    
+
     // Convert persisted links to Link structs
-    let links = persisted.links.iter()
+    let links = persisted
+        .links
+        .iter()
         .filter_map(|l| {
             Some(Link {
                 repo: PathBuf::from(&l.path),
@@ -821,21 +855,24 @@ fn load_links_from_file(root: &Path) -> Option<Vec<Link>> {
             })
         })
         .collect();
-    
-    tracing::debug!("loaded {} links from cache for {}", persisted.links.len(), root_str);
+
+    tracing::debug!(
+        "loaded {} links from cache for {}",
+        persisted.links.len(),
+        root_str
+    );
     Some(links)
 }
 
 /// Save discovered links to the cache file.
 fn save_links_to_file(root: &Path, links: &[Link]) -> Result<()> {
     let cache_path = links_cache_path(root);
-    
+
     // Ensure parent directory exists
     if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)
-            .context("failed to create links cache directory")?;
+        std::fs::create_dir_all(parent).context("failed to create links cache directory")?;
     }
-    
+
     let persisted = PersistedLinks {
         version: LINKS_CACHE_VERSION,
         updated_at: std::time::SystemTime::now()
@@ -843,7 +880,8 @@ fn save_links_to_file(root: &Path, links: &[Link]) -> Result<()> {
             .unwrap_or_default()
             .as_secs() as i64,
         project_root: root.to_string_lossy().to_string(),
-        links: links.iter()
+        links: links
+            .iter()
             .map(|l| PersistedLink {
                 path: l.repo.to_string_lossy().to_string(),
                 project_id: l.project_id.clone(),
@@ -852,14 +890,17 @@ fn save_links_to_file(root: &Path, links: &[Link]) -> Result<()> {
             })
             .collect(),
     };
-    
-    let json = serde_json::to_string_pretty(&persisted)
-        .context("failed to serialize links cache")?;
-    
-    std::fs::write(&cache_path, json)
-        .context("failed to write links cache")?;
-    
-    tracing::debug!("saved {} links to cache for {}", links.len(), root.to_string_lossy());
+
+    let json =
+        serde_json::to_string_pretty(&persisted).context("failed to serialize links cache")?;
+
+    std::fs::write(&cache_path, json).context("failed to write links cache")?;
+
+    tracing::debug!(
+        "saved {} links to cache for {}",
+        links.len(),
+        root.to_string_lossy()
+    );
     Ok(())
 }
 
@@ -874,7 +915,7 @@ pub fn invalidate_links_cache(root: &Path) {
             tracing::info!("invalidated links cache for {}", root.to_string_lossy());
         }
     }
-    
+
     // Also clear in-memory cache
     if let Ok(mut cache) = link_cache().try_write() {
         cache.remove(root);
@@ -932,7 +973,11 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
         // Update in-memory cache
         if let Ok(mut cache) = link_cache().try_write() {
             if cache.len() >= MAX_LINK_CACHE_SIZE {
-                let keys: Vec<_> = cache.keys().take(MAX_LINK_CACHE_SIZE / 2).cloned().collect();
+                let keys: Vec<_> = cache
+                    .keys()
+                    .take(MAX_LINK_CACHE_SIZE / 2)
+                    .cloned()
+                    .collect();
                 for k in keys {
                     cache.remove(&k);
                 }
@@ -957,23 +1002,40 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
             let project_id = l["projectId"].as_str().unwrap_or("").to_string();
             let mount = l["mount"].as_str().unwrap_or("").to_string();
             let name = l["name"].as_str().unwrap_or("linked").to_string();
-            Some(Link { repo, db, project_id, mount, name })
+            Some(Link {
+                repo,
+                db,
+                project_id,
+                mount,
+                name,
+            })
         })
         .collect();
 
     // Save to file (best effort, don't fail if it errors)
-    tracing::info!("saving {} links to file for {}", links.len(), root_path.display());
+    tracing::info!(
+        "saving {} links to file for {}",
+        links.len(),
+        root_path.display()
+    );
     if let Err(e) = save_links_to_file(&root_path, &links) {
         tracing::warn!("failed to save links cache: {}", e);
     } else {
-        tracing::info!("links cache saved successfully to {}", links_cache_path(&root_path).display());
+        tracing::info!(
+            "links cache saved successfully to {}",
+            links_cache_path(&root_path).display()
+        );
     }
 
     // Update in-memory cache
     match link_cache().try_write() {
         Ok(mut cache) => {
             if cache.len() >= MAX_LINK_CACHE_SIZE {
-                let keys: Vec<_> = cache.keys().take(MAX_LINK_CACHE_SIZE / 2).cloned().collect();
+                let keys: Vec<_> = cache
+                    .keys()
+                    .take(MAX_LINK_CACHE_SIZE / 2)
+                    .cloned()
+                    .collect();
                 for k in keys {
                     cache.remove(&k);
                 }
@@ -989,7 +1051,8 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
 }
 
 fn link_index_inflight() -> &'static tokio::sync::Mutex<HashSet<PathBuf>> {
-    static SET: std::sync::OnceLock<tokio::sync::Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    static SET: std::sync::OnceLock<tokio::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
     SET.get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
 }
 
@@ -1018,7 +1081,12 @@ async fn ensure_link_index(link: Link, tier: &str, dims: u32, parent_root: &str)
     // Check skip in parent project config
     let parent_path = std::path::PathBuf::from(parent_root);
     let project = crate::config::load(&parent_path);
-    if project.linked.get(&link.name).map(|l| l.skip).unwrap_or(false) {
+    if project
+        .linked
+        .get(&link.name)
+        .map(|l| l.skip)
+        .unwrap_or(false)
+    {
         return;
     }
 
@@ -1040,7 +1108,11 @@ async fn ensure_link_index(link: Link, tier: &str, dims: u32, parent_root: &str)
         crate::discover::invalidate_discovery_cache(&repo_for_discover);
         let parent_project = crate::config::load(&parent_path_for_cfg);
         let linked_project = crate::config::load(&repo_for_discover);
-        let cfg = crate::config::effective(&parent_project, Some(&name_for_discover), Some(&linked_project));
+        let cfg = crate::config::effective(
+            &parent_project,
+            Some(&name_for_discover),
+            Some(&linked_project),
+        );
         match crate::discover::discover_files_with_config(&repo_for_discover, &cfg) {
             Ok(result) => link_index_weight(result.files.len()),
             Err(_) => 2, // default to medium weight on discovery failure
@@ -1081,15 +1153,17 @@ async fn ensure_link_index(link: Link, tier: &str, dims: u32, parent_root: &str)
             let linked_project = crate::config::load(&link.repo);
 
             // Get effective config: merge parent's linked[name] with linked project's own config
-            let effective_cfg = crate::config::effective(
-                &parent_project,
-                Some(&link.name),
-                Some(&linked_project),
-            );
+            let effective_cfg =
+                crate::config::effective(&parent_project, Some(&link.name), Some(&linked_project));
 
             let root = link.repo.to_string_lossy().to_string();
-            tracing::info!("linked index start: {} (weight={}/8, exclude: {:?}, include: {:?})", 
-                root, weight, effective_cfg.exclude, effective_cfg.include);
+            tracing::info!(
+                "linked index start: {} (weight={}/8, exclude: {:?}, include: {:?})",
+                root,
+                weight,
+                effective_cfg.exclude,
+                effective_cfg.include
+            );
             let r = run_index_impl(
                 &root,
                 None,
@@ -1121,7 +1195,7 @@ async fn cached_storage(path: &Path, dims: u32) -> anyhow::Result<Arc<crate::sto
         if let Some(cached) = r.get(&key) {
             let storage = cached.storage.clone();
             drop(r);
-            
+
             // Update last_access with write lock
             let mut w = cache.write().await;
             if let Some(entry) = w.get_mut(&key) {
@@ -1136,10 +1210,11 @@ async fn cached_storage(path: &Path, dims: u32) -> anyhow::Result<Arc<crate::sto
     let storage = Arc::new(storage);
     {
         let mut w = cache.write().await;
-        
+
         // Evict oldest entry if cache is full
         if w.len() >= MAX_STORAGE_CACHE_SIZE && !w.contains_key(&key) {
-            if let Some(oldest_key) = w.iter()
+            if let Some(oldest_key) = w
+                .iter()
                 .min_by_key(|(_, cached)| cached.last_access)
                 .map(|(k, _)| k.clone())
             {
@@ -1151,7 +1226,7 @@ async fn cached_storage(path: &Path, dims: u32) -> anyhow::Result<Arc<crate::sto
                 w.remove(&oldest_key);
             }
         }
-        
+
         w.entry(key).or_insert_with(|| CachedStorage {
             storage: storage.clone(),
             last_access: Instant::now(),
@@ -1165,13 +1240,10 @@ async fn invalidate_storage_cache(path: &Path) {
     let path_str = path.to_string_lossy().to_string();
     let cache = storage_cache();
     let mut w = cache.write().await;
-    
+
     // Remove all entries for this path (any dimension)
-    let keys_to_remove: Vec<_> = w.keys()
-        .filter(|(p, _)| p == &path_str)
-        .cloned()
-        .collect();
-    
+    let keys_to_remove: Vec<_> = w.keys().filter(|(p, _)| p == &path_str).cloned().collect();
+
     for key in keys_to_remove {
         tracing::debug!("invalidating storage cache for {:?}", key);
         w.remove(&key);
@@ -1180,54 +1252,57 @@ async fn invalidate_storage_cache(path: &Path) {
 
 /// Trigger a background reindex for auto-recovery from corruption.
 async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Result<()> {
-    use crate::storage;
-    use crate::model_client;
     use crate::config;
     use crate::discover;
-    
+    use crate::model_client;
+    use crate::storage;
+
     let started = std::time::Instant::now();
     let root = PathBuf::from(root).canonicalize()?;
     let storage_path = storage::storage_path(&root);
-    
+
     // Load config
     let project = config::load(&root);
     let cfg = config::effective(&project, Some(tier), None);
-    
+
     // Discover files (blocking operation, run in thread pool)
     let root_clone = root.clone();
     let cfg_clone = cfg.clone();
-    let discovery = tokio::task::spawn_blocking(move || 
+    let discovery = tokio::task::spawn_blocking(move || {
         discover::discover_files_with_config(&root_clone, &cfg_clone)
-    ).await??;
-    
+    })
+    .await??;
+
     if discovery.files.is_empty() {
         tracing::info!("auto-recovery: no files to index for {}", root.display());
         return Ok(());
     }
-    
+
     tracing::info!(
         "auto-recovery: indexing {} files in {}",
         discovery.files.len(),
         root.display()
     );
-    
+
     // Open fresh storage (will create new .lancedb)
     let storage = storage::Storage::open(&storage_path, dims).await?;
     storage.set_tier(tier).await?;
     storage.set_dimensions(dims).await?;
-    
+
     // Run indexing (simplified - just index all files)
     let mut client = model_client::pooled().await?;
     let embed = tokio::sync::Semaphore::new(1);
-    
+
     // Create WriteQueue for auto-recovery indexing
     let storage_arc = Arc::new(storage);
     let write_queue = crate::storage::WriteQueue::new(storage_arc.clone(), 32);
-    
+
     for file in &discovery.files {
         let file_path = root.join(file);
-        if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) { continue; }
-        
+        if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
+            continue;
+        }
+
         match crate::cli::update_file_partial_pub(
             &root,
             &[],
@@ -1244,38 +1319,51 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
             false,
             false,
             &write_queue,
-        ).await {
+        )
+        .await
+        {
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!("auto-recovery: failed to index {}: {}", file.display(), e);
             }
         }
     }
-    
+
     // Wait for all writes to complete
     let _ = write_queue.shutdown().await;
-    
+
     // Set metadata after indexing completes (duration, files, timestamps)
     let elapsed = started.elapsed();
-    let _ = storage_arc.set_last_index_duration_ms((elapsed.as_millis() as i64).max(0)).await;
+    let _ = storage_arc
+        .set_last_index_duration_ms((elapsed.as_millis() as i64).max(0))
+        .await;
     let file_count = storage_arc.count_files().await.unwrap_or(0);
-    let _ = storage_arc.set_last_index_files_count(file_count as i64).await;
+    let _ = storage_arc
+        .set_last_index_files_count(file_count as i64)
+        .await;
     let now = chrono::Utc::now().to_rfc3339();
     let _ = storage_arc.set_last_index_timestamp(&now).await;
     let _ = storage_arc.set_last_update_timestamp(&now).await;
-    
+
     // Update cache with new storage
     let storage = storage_arc;
     let key = (storage_path.to_string_lossy().to_string(), dims);
     {
         let mut w = storage_cache().write().await;
-        w.insert(key, CachedStorage {
-            storage,
-            last_access: Instant::now(),
-        });
+        w.insert(
+            key,
+            CachedStorage {
+                storage,
+                last_access: Instant::now(),
+            },
+        );
     }
-    
-    tracing::info!("auto-recovery: indexing complete for {} ({} files)", root.display(), file_count);
+
+    tracing::info!(
+        "auto-recovery: indexing complete for {} ({} files)",
+        root.display(),
+        file_count
+    );
     Ok(())
 }
 
@@ -1329,7 +1417,11 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let auto = params["autoFederate"].as_bool().unwrap_or(true);
             let explicit: Vec<String> = params["federatedDb"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Auto-discover linked DBs when none are explicitly provided.
@@ -1368,7 +1460,8 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let federated = if !explicit.is_empty() {
                 explicit
             } else if auto {
-                links.iter()
+                links
+                    .iter()
                     .filter_map(|l| l.db.to_str().map(String::from))
                     .collect()
             } else {
@@ -1380,26 +1473,32 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
                 Err(e) => {
                     // Check for corruption and auto-recover
                     if crate::storage::is_corruption_error(&e) {
-                        let storage_path = db.map(PathBuf::from)
+                        let storage_path = db
+                            .map(PathBuf::from)
                             .unwrap_or_else(|| crate::storage::storage_path(&PathBuf::from(root)));
-                        
+
                         // Clear corrupted index
                         if let Ok(true) = crate::storage::clear_corrupted_index(&storage_path) {
                             // Invalidate the storage cache for this path
                             invalidate_storage_cache(&storage_path).await;
-                            
+
                             // Trigger background reindex
                             let root_owned = root.to_string();
                             let tier_owned = tier.to_string();
                             tokio::spawn(async move {
-                                tracing::info!("auto-recovery: triggering background reindex for {}", root_owned);
+                                tracing::info!(
+                                    "auto-recovery: triggering background reindex for {}",
+                                    root_owned
+                                );
                                 // Small delay to let any pending operations settle
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                if let Err(e) = run_index_background(&root_owned, &tier_owned, dims).await {
+                                if let Err(e) =
+                                    run_index_background(&root_owned, &tier_owned, dims).await
+                                {
                                     tracing::error!("auto-recovery reindex failed: {}", e);
                                 }
                             });
-                            
+
                             serde_json::json!({
                                 "results": [],
                                 "rebuilding": true,
@@ -1426,7 +1525,11 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let auto = params["autoFederate"].as_bool().unwrap_or(true);
             let explicit_ids: Vec<String> = params["federatedProjectIds"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Auto-discover linked project IDs when none are explicitly provided
@@ -1450,7 +1553,9 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
                 vec![]
             };
 
-            match search_memories_impl(shared, project_id, query, limit, tier, dims, &federated_ids).await {
+            match search_memories_impl(shared, project_id, query, limit, tier, dims, &federated_ids)
+                .await
+            {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({"results": [], "error": e.to_string()}),
             }
@@ -1491,11 +1596,19 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let force = params["force"].as_bool().unwrap_or(false);
             let exclude: Vec<String> = params["exclude"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let include: Vec<String> = params["include"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             match run_index_impl(root, db, tier, dims, force, &exclude, &include).await {
@@ -1508,19 +1621,31 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let root = params["root"].as_str().unwrap_or(".").to_string();
             let exclude: Vec<String> = params["exclude"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let include: Vec<String> = params["include"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
-            match tokio::task::spawn_blocking(move || discover_files_impl(&root, &exclude, &include))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                discover_files_impl(&root, &exclude, &include)
+            })
+            .await
             {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => serde_json::json!({"files": [], "error": e.to_string()}),
-                Err(e) => serde_json::json!({"files": [], "error": format!("spawn_blocking failed: {}", e)}),
+                Err(e) => {
+                    serde_json::json!({"files": [], "error": format!("spawn_blocking failed: {}", e)})
+                }
             }
         }
 
@@ -1535,12 +1660,12 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
 
         "discover_links" => {
             let root = params["root"].as_str().unwrap_or(".").to_string();
-            match tokio::task::spawn_blocking(move || discover_links_impl(&root))
-                .await
-            {
+            match tokio::task::spawn_blocking(move || discover_links_impl(&root)).await {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => serde_json::json!({"links": [], "error": e.to_string()}),
-                Err(e) => serde_json::json!({"links": [], "error": format!("spawn_blocking failed: {}", e)}),
+                Err(e) => {
+                    serde_json::json!({"links": [], "error": format!("spawn_blocking failed: {}", e)})
+                }
             }
         }
 
@@ -1564,7 +1689,7 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let root = params["root"].as_str().unwrap_or(".");
             let tier = params["tier"].as_str().unwrap_or("budget");
             let dims: u32 = params["dimensions"].as_u64().unwrap_or(1024) as u32;
-            
+
             let root_owned = root.to_string();
             let links = tokio::task::spawn_blocking(move || cached_discover_links(&root_owned))
                 .await
@@ -1573,7 +1698,7 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             for link in links {
                 ensure_link_index(link, tier, dims, root).await;
             }
-            
+
             serde_json::json!({"success": true, "triggered": count})
         }
 
@@ -1592,16 +1717,20 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
         // These methods are intercepted by the server loop before reaching handle_request().
         // They require access to shared DaemonState and are handled directly in the server loop.
         // This arm exists only as a safety net - if reached, it indicates a bug in the server loop.
-        "tui_connect" | "tui_disconnect" | "tui_connections"
-        | "watcher_stop" | "watcher_start" | "watcher_status" | "startup_check" | "shutdown" => {
-            tracing::error!("method {} should be handled by server loop, not handle_request()", method);
+        "tui_connect" | "tui_disconnect" | "tui_connections" | "watcher_stop" | "watcher_start"
+        | "watcher_status" | "startup_check" | "shutdown" => {
+            tracing::error!(
+                "method {} should be handled by server loop, not handle_request()",
+                method
+            );
             serde_json::json!({"error": format!("internal error: {} should be handled by server loop", method)})
         }
 
         "cleanup" => {
             let cfg = crate::cleaner::config();
             let base = crate::storage::shared_data_dir();
-            match tokio::task::spawn_blocking(move || crate::cleaner::run(&base, &cfg, false)).await {
+            match tokio::task::spawn_blocking(move || crate::cleaner::run(&base, &cfg, false)).await
+            {
                 Ok(report) => serde_json::json!({
                     "success": true,
                     "orphans": report.orphans,
@@ -1617,7 +1746,8 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
         "cleanup_dry_run" => {
             let cfg = crate::cleaner::config();
             let base = crate::storage::shared_data_dir();
-            match tokio::task::spawn_blocking(move || crate::cleaner::run(&base, &cfg, true)).await {
+            match tokio::task::spawn_blocking(move || crate::cleaner::run(&base, &cfg, true)).await
+            {
                 Ok(report) => serde_json::json!({
                     "success": true,
                     "orphans": report.orphans,
@@ -1693,18 +1823,30 @@ fn resolve_paths_impl(root: &str, shared: &str, project_id: &str) -> serde_json:
 // index_file
 // ============================================================================
 
-async fn index_file_impl(root: &str, db: Option<&str>, file: &str, tier: &str, dims: u32) -> Result<serde_json::Value> {
+async fn index_file_impl(
+    root: &str,
+    db: Option<&str>,
+    file: &str,
+    tier: &str,
+    dims: u32,
+) -> Result<serde_json::Value> {
     use crate::storage;
 
     let root = PathBuf::from(root).canonicalize()?;
-    let storage_path = db.map(PathBuf::from).unwrap_or_else(|| storage::storage_path(&root));
+    let storage_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| storage::storage_path(&root));
     let storage = cached_storage(&storage_path, dims).await?;
 
-    let file_path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { root.join(file) };
+    let file_path = if Path::new(file).is_absolute() {
+        PathBuf::from(file)
+    } else {
+        root.join(file)
+    };
     let file_path = file_path.canonicalize().context("invalid file")?;
 
     // Fast-path: skip unchanged files without connecting to the model server.
-    // This keeps re-index latency low and avoids unnecessary socket churn.
+    // This keeps re-index latency low and avoids unnecessary connection churn.
     let rel = crate::discover::relative_path(&file_path, &root, &[]);
     if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
         let file_hash = storage::hash_content(&content);
@@ -1717,28 +1859,29 @@ async fn index_file_impl(root: &str, db: Option<&str>, file: &str, tier: &str, d
     // This avoids re-embedding unchanged chunks and preserves chunk IDs.
     let mut client = crate::model_client::pooled().await?;
     let embed = tokio::sync::Semaphore::new(1);
-    
+
     // Create WriteQueue for this single file operation
     let write_queue = crate::storage::WriteQueue::new(storage.clone(), 32);
-    
+
     let result = crate::cli::update_file_partial_pub(
         &root,
-        &[],             // include_dirs
-        &[],             // symlink_dirs (not applicable for daemon single-file indexing)
+        &[], // include_dirs
+        &[], // symlink_dirs (not applicable for daemon single-file indexing)
         &storage_path,
         &*storage,
         &mut client,
         &file_path,
         tier,
         dims,
-        "int8",          // quantization
-        None,            // daily_cost_limit
+        "int8", // quantization
+        None,   // daily_cost_limit
         &embed,
-        false,           // force
-        false,           // verbose
+        false, // force
+        false, // verbose
         &write_queue,
-    ).await?;
-    
+    )
+    .await?;
+
     // Wait for all writes to complete
     let _stats = write_queue.shutdown().await;
 
@@ -1747,7 +1890,7 @@ async fn index_file_impl(root: &str, db: Option<&str>, file: &str, tier: &str, d
             // Update last_update_timestamp after successful indexing
             let now = chrono::Utc::now().to_rfc3339();
             let _ = storage.set_last_update_timestamp(&now).await;
-            
+
             Ok(serde_json::json!({
                 "success": true,
                 "chunks": update.chunks,
@@ -1766,26 +1909,33 @@ async fn index_file_impl(root: &str, db: Option<&str>, file: &str, tier: &str, d
 // remove_file
 // ============================================================================
 
-async fn remove_file_impl(root: &str, db: Option<&str>, file: &str, dims: u32) -> Result<serde_json::Value> {
-    use crate::storage;
+async fn remove_file_impl(
+    root: &str,
+    db: Option<&str>,
+    file: &str,
+    dims: u32,
+) -> Result<serde_json::Value> {
     use crate::discover::relative_path;
+    use crate::storage;
 
     let root = PathBuf::from(root).canonicalize()?;
-    let storage_path = db.map(PathBuf::from).unwrap_or_else(|| storage::storage_path(&root));
+    let storage_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| storage::storage_path(&root));
     let storage = cached_storage(&storage_path, dims).await?;
     let rel = relative_path(Path::new(file), &root, &[]);
-    
+
     // Get count before deletion
     let chunks = storage.get_chunks_with_hashes(&rel).await?;
     let removed = chunks.len();
-    
+
     // Create WriteQueue for deletion
     let write_queue = crate::storage::WriteQueue::new(storage.clone(), 32);
     write_queue.delete_file(&rel).await;
-    
+
     // Wait for deletion to complete
     let _ = write_queue.shutdown().await;
-    
+
     Ok(serde_json::json!({"success": true, "removed": removed, "path": rel}))
 }
 
@@ -1829,18 +1979,20 @@ async fn search_impl(
     federated: &[String],
     mounts: &HashMap<String, String>,
 ) -> Result<serde_json::Value> {
-    use crate::storage;
     use crate::model_client;
+    use crate::storage;
     use std::collections::HashSet;
 
     let root = PathBuf::from(root);
-    let storage_path = db.map(PathBuf::from).unwrap_or_else(|| storage::storage_path(&root));
+    let storage_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| storage::storage_path(&root));
 
     let mut all_paths: Vec<PathBuf> = vec![storage_path];
     all_paths.extend(federated.iter().map(PathBuf::from));
 
     let num_projects = all_paths.len();
-    
+
     // Warn if too many federated DBs (potential resource issue)
     if num_projects > FEDERATED_DB_WARNING_THRESHOLD {
         tracing::warn!(
@@ -1849,7 +2001,7 @@ async fn search_impl(
             FEDERATED_DB_WARNING_THRESHOLD
         );
     }
-    
+
     // Adaptive strategy: skip per-project rerank for many projects (speed optimization)
     let use_vector_only = num_projects > SKIP_STAGE1_RERANK_THRESHOLD;
 
@@ -1866,12 +2018,14 @@ async fn search_impl(
             let query = query.to_string();
             let tier = tier.to_string();
             let key = sp.to_string_lossy().to_string();
-            let prefix = mounts.get(&key).map(|s| s.trim_end_matches('/').to_string());
+            let prefix = mounts
+                .get(&key)
+                .map(|s| s.trim_end_matches('/').to_string());
 
             tokio::spawn(async move {
                 // Acquire semaphore permit to limit concurrency
                 let _permit = sem.acquire().await.ok();
-                
+
                 if use_vector_only {
                     // Fast path: vector search only, no per-project rerank
                     search_single_db_vector_only(sp, &query, &tier, dims, prefix).await
@@ -1889,9 +2043,8 @@ async fn search_impl(
     // Memory is bounded by: num_projects * max(STAGE1_TOP_K, VECTOR_ONLY_TOP_K) results
     // With 100 projects × 15 results = 1500 results max (~15MB for large content)
     // This is acceptable for search quality - global rerank will select the best
-    let mut stage1_results: Vec<(f64, String, String)> = Vec::with_capacity(
-        num_projects * std::cmp::max(STAGE1_TOP_K as usize, VECTOR_ONLY_TOP_K)
-    );
+    let mut stage1_results: Vec<(f64, String, String)> =
+        Vec::with_capacity(num_projects * std::cmp::max(STAGE1_TOP_K as usize, VECTOR_ONLY_TOP_K));
     for result in results {
         match result {
             Ok(Ok(ranked)) => stage1_results.extend(ranked),
@@ -1923,7 +2076,9 @@ async fn search_impl(
         // Global rerank on combined results
         let docs: Vec<&str> = stage1_results.iter().map(|(_, _, c)| c.as_str()).collect();
         let mut client = model_client::pooled().await?;
-        let global_ranked = client.rerank(query, &docs, rerank_model, FINAL_TOP_K).await?;
+        let global_ranked = client
+            .rerank(query, &docs, rerank_model, FINAL_TOP_K)
+            .await?;
 
         // Build final results with globally comparable scores
         let mut final_ranked: Vec<(f64, String, String)> = Vec::new();
@@ -1979,7 +2134,9 @@ async fn search_single_db_stage1(
 
     // First-pass rerank: filter to top STAGE1_TOP_K for this project
     let docs: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
-    let ranked = client.rerank(query, &docs, rerank_model, STAGE1_TOP_K).await?;
+    let ranked = client
+        .rerank(query, &docs, rerank_model, STAGE1_TOP_K)
+        .await?;
 
     let mut ranked_results = Vec::new();
     for (idx, score) in ranked {
@@ -2022,7 +2179,9 @@ async fn search_single_db_vector_only(
 
     // Vector search only - no rerank (speed optimization for many projects)
     let qvec = client.embed_query(query, embed_model, stored_dims).await?;
-    let results = storage.search_hybrid(query, &qvec, VECTOR_ONLY_TOP_K).await?;
+    let results = storage
+        .search_hybrid(query, &qvec, VECTOR_ONLY_TOP_K)
+        .await?;
 
     let mut ranked_results = Vec::new();
     for r in results {
@@ -2057,7 +2216,11 @@ async fn search_memories_impl(
     let mut db_paths: Vec<(PathBuf, String)> = Vec::new(); // (db_path, scope)
 
     // Project memories
-    let project_mem_db = shared.join("projects").join(project_id).join("memories").join(".lancedb");
+    let project_mem_db = shared
+        .join("projects")
+        .join(project_id)
+        .join("memories")
+        .join(".lancedb");
     db_paths.push((project_mem_db, "project".into()));
 
     // Global memories
@@ -2066,7 +2229,11 @@ async fn search_memories_impl(
 
     // Federated project memories
     for fid in federated_ids {
-        let db = shared.join("projects").join(fid).join("memories").join(".lancedb");
+        let db = shared
+            .join("projects")
+            .join(fid)
+            .join("memories")
+            .join(".lancedb");
         db_paths.push((db, format!("linked:{fid}")));
     }
 
@@ -2074,16 +2241,21 @@ async fn search_memories_impl(
     let mut all: Vec<serde_json::Value> = Vec::new();
 
     for (db_path, scope) in &db_paths {
-        if !tokio::fs::try_exists(db_path).await.unwrap_or(false) { continue; }
+        if !tokio::fs::try_exists(db_path).await.unwrap_or(false) {
+            continue;
+        }
 
         let results = search_single_index(db_path, query, tier, dims, limit).await;
         match results {
             Ok(ranked) => {
                 for (score, file_path, content) in ranked {
-                    let filename = Path::new(&file_path).file_name()
-                        .and_then(|n| n.to_str()).unwrap_or(&file_path);
+                    let filename = Path::new(&file_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&file_path);
                     let id = filename.strip_suffix(".md").unwrap_or(filename);
-                    let title = content.lines()
+                    let title = content
+                        .lines()
                         .find(|l| l.starts_with("# "))
                         .map(|l| l[2..].trim().to_string())
                         .unwrap_or_else(|| id.to_string());
@@ -2143,22 +2315,28 @@ async fn search_activity_impl(
     }
 
     let ranked = search_single_index(&db_path, query, tier, dims, limit).await?;
-    let results: Vec<serde_json::Value> = ranked.into_iter().map(|(score, file_path, content)| {
-        let filename = Path::new(&file_path).file_name()
-            .and_then(|n| n.to_str()).unwrap_or(&file_path);
-        let id = filename.strip_suffix(".md").unwrap_or(filename);
-        let title = content.lines()
-            .find(|l| l.starts_with("# "))
-            .map(|l| l[2..].trim().to_string())
-            .unwrap_or_else(|| id.to_string());
-        serde_json::json!({
-            "id": id,
-            "path": filename,
-            "title": title,
-            "content": content,
-            "score": score,
+    let results: Vec<serde_json::Value> = ranked
+        .into_iter()
+        .map(|(score, file_path, content)| {
+            let filename = Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&file_path);
+            let id = filename.strip_suffix(".md").unwrap_or(filename);
+            let title = content
+                .lines()
+                .find(|l| l.starts_with("# "))
+                .map(|l| l[2..].trim().to_string())
+                .unwrap_or_else(|| id.to_string());
+            serde_json::json!({
+                "id": id,
+                "path": filename,
+                "title": title,
+                "content": content,
+                "score": score,
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(serde_json::json!({"results": results}))
 }
@@ -2170,31 +2348,35 @@ async fn search_skills_impl(
     tier: &str,
     dims: u32,
 ) -> Result<serde_json::Value> {
-    let db_path = PathBuf::from(shared)
-        .join("skills")
-        .join(".lancedb");
+    let db_path = PathBuf::from(shared).join("skills").join(".lancedb");
 
     if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
         return Ok(serde_json::json!({"results": []}));
     }
 
     let ranked = search_single_index(&db_path, query, tier, dims, limit).await?;
-    let results: Vec<serde_json::Value> = ranked.into_iter().map(|(score, file_path, content)| {
-        let filename = Path::new(&file_path).file_name()
-            .and_then(|n| n.to_str()).unwrap_or(&file_path);
-        let id = filename.strip_suffix(".md").unwrap_or(filename);
-        let title = content.lines()
-            .find(|l| l.starts_with("# "))
-            .map(|l| l[2..].trim().to_string())
-            .unwrap_or_else(|| id.to_string());
-        serde_json::json!({
-            "id": id,
-            "path": filename,
-            "title": title,
-            "content": content,
-            "score": score,
+    let results: Vec<serde_json::Value> = ranked
+        .into_iter()
+        .map(|(score, file_path, content)| {
+            let filename = Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&file_path);
+            let id = filename.strip_suffix(".md").unwrap_or(filename);
+            let title = content
+                .lines()
+                .find(|l| l.starts_with("# "))
+                .map(|l| l[2..].trim().to_string())
+                .unwrap_or_else(|| id.to_string());
+            serde_json::json!({
+                "id": id,
+                "path": filename,
+                "title": title,
+                "content": content,
+                "score": score,
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(serde_json::json!({"results": results}))
 }
@@ -2230,12 +2412,18 @@ async fn search_single_index(
     }
 
     let docs: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
-    let ranked = client.rerank(query, &docs, rerank_model, limit as u32).await?;
+    let ranked = client
+        .rerank(query, &docs, rerank_model, limit as u32)
+        .await?;
 
     let mut out = Vec::new();
     for (idx, score) in ranked {
         if idx < results.len() {
-            out.push((score.into(), results[idx].path.clone(), results[idx].content.clone()));
+            out.push((
+                score.into(),
+                results[idx].path.clone(),
+                results[idx].content.clone(),
+            ));
         }
     }
     Ok(out)
@@ -2257,7 +2445,9 @@ async fn run_index_impl(
     use crate::storage;
 
     let root = PathBuf::from(root).canonicalize()?;
-    let storage_path = db.map(PathBuf::from).unwrap_or_else(|| storage::storage_path(&root));
+    let storage_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| storage::storage_path(&root));
 
     // Register this db path as actively indexing so status_impl won't self-heal it away.
     let key = storage_path.to_string_lossy().to_string();
@@ -2275,7 +2465,7 @@ async fn run_index_impl(
     }
     let _guard = Guard(key);
 
-    // Note: Daemon is a singleton (enforced by socket lock); no external watcher PID check needed.
+    // Note: Daemon is a singleton (enforced by port lock); no external watcher PID check needed.
     // Acquiring it here would cause a double-lock error since the daemon's PID
     // would be written to the lock file, and then run_indexing would detect it
     // as "already running".
@@ -2290,12 +2480,12 @@ async fn run_index_impl(
         dims,
         "int8",
         force,
-        None, // daily_cost_limit
+        None,  // daily_cost_limit
         false, // verbose
         exclude,
         &include_paths,
-        5,    // concurrency
-        None, // scan_concurrency
+        5,     // concurrency
+        None,  // scan_concurrency
         false, // quiet
         false, // json_lines
     )
@@ -2363,7 +2553,11 @@ async fn run_index_impl(
 // discover_files — dry-run file listing
 // ============================================================================
 
-fn discover_files_impl(root: &str, exclude: &[String], include: &[String]) -> Result<serde_json::Value> {
+fn discover_files_impl(
+    root: &str,
+    exclude: &[String],
+    include: &[String],
+) -> Result<serde_json::Value> {
     use crate::config;
     use crate::discover;
 
@@ -2375,18 +2569,26 @@ fn discover_files_impl(root: &str, exclude: &[String], include: &[String]) -> Re
     let discovery = discover::discover_files_with_config(&root, &cfg)?;
 
     let include_dirs: Vec<PathBuf> = include.iter().map(PathBuf::from).collect();
-    let mut files: Vec<String> = discovery.files.iter()
+    let mut files: Vec<String> = discovery
+        .files
+        .iter()
         .map(|p| discover::relative_path(p, &root, &include_dirs))
         .collect();
 
     // Add files from include dirs
     if !include_dirs.is_empty() {
-        let mut seen: std::collections::HashSet<PathBuf> = discovery.files.iter()
+        let mut seen: std::collections::HashSet<PathBuf> = discovery
+            .files
+            .iter()
             .filter_map(|p| p.canonicalize().ok())
             .collect();
         let extra = discover::discover_additional_files(
             &include_dirs,
-            if exclude.is_empty() { None } else { Some(exclude) },
+            if exclude.is_empty() {
+                None
+            } else {
+                Some(exclude)
+            },
             &mut seen,
         );
         for f in &extra {
@@ -2424,7 +2626,7 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
 
     // If indexing was interrupted (SIGKILL, crash, etc.), the progress keys can
     // get stuck. Self-heal by clearing progress on status check (daemon singleton
-    // enforced by socket lock; no PID files needed).
+    // enforced by port lock; no PID files needed).
     // Guard: skip self-heal when this db is actively being indexed to avoid a
     // race where status clears progress set by the concurrent run_index call.
     {
@@ -2457,26 +2659,43 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
     let indexing_in_progress = storage.get_indexing_in_progress().await.unwrap_or(false);
     let indexing_started_at = storage.get_indexing_start_time().await.unwrap_or(None);
     let indexing_phase = storage.get_indexing_phase().await.unwrap_or(None);
-    let (scanning_done, scanning_total) = storage.get_phase_progress("scanning").await.unwrap_or((0, 0));
-    let (chunking_done, chunking_total) = storage.get_phase_progress("chunking").await.unwrap_or((0, 0));
-    let (embedding_done, embedding_total) = storage.get_phase_progress("embedding").await.unwrap_or((0, 0));
+    let (scanning_done, scanning_total) = storage
+        .get_phase_progress("scanning")
+        .await
+        .unwrap_or((0, 0));
+    let (chunking_done, chunking_total) = storage
+        .get_phase_progress("chunking")
+        .await
+        .unwrap_or((0, 0));
+    let (embedding_done, embedding_total) = storage
+        .get_phase_progress("embedding")
+        .await
+        .unwrap_or((0, 0));
 
     // Check for index corruption by verifying lance table directories exist
     let mut corrupted = false;
     let mut corruption_errors: Vec<String> = Vec::new();
-    
+
     if chunks > 0 || files > 0 {
         // If we have data, verify the lance tables are intact
         let chunks_table = sp.join("chunks.lance");
         let config_table = sp.join("config.lance");
-        
-        if !tokio::fs::metadata(&chunks_table).await.map(|m| m.is_dir()).unwrap_or(false) {
+
+        if !tokio::fs::metadata(&chunks_table)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             corrupted = true;
             corruption_errors.push("Missing chunks.lance table directory".into());
         } else {
             // Check for data files in chunks.lance/data/
             let data_dir = chunks_table.join("data");
-            if tokio::fs::metadata(&data_dir).await.map(|m| m.is_dir()).unwrap_or(false) {
+            if tokio::fs::metadata(&data_dir)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 // Verify at least one .lance file exists
                 let has_data = {
                     let mut found = false;
@@ -2496,14 +2715,22 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
                 }
             }
         }
-        
-        if !tokio::fs::metadata(&config_table).await.map(|m| m.is_dir()).unwrap_or(false) {
+
+        if !tokio::fs::metadata(&config_table)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             corrupted = true;
             corruption_errors.push("Missing config.lance table directory".into());
         } else {
             // Check for data files in config.lance/data/
             let data_dir = config_table.join("data");
-            if tokio::fs::metadata(&data_dir).await.map(|m| m.is_dir()).unwrap_or(false) {
+            if tokio::fs::metadata(&data_dir)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 let has_data = {
                     let mut found = false;
                     if let Ok(mut dir) = tokio::fs::read_dir(&data_dir).await {
@@ -2593,7 +2820,10 @@ fn discover_links_impl(root: &str) -> Result<serde_json::Value> {
     let submodules = discover::discover_submodules(&root);
     for (sub_path, name) in &submodules {
         // Skip if already found as a symlink-based link
-        if links.iter().any(|l| l["path"].as_str() == Some(sub_path.to_str().unwrap_or(""))) {
+        if links
+            .iter()
+            .any(|l| l["path"].as_str() == Some(sub_path.to_str().unwrap_or("")))
+        {
             continue;
         }
         // Skip repos marked with skip: true in .opencode-index.yaml
@@ -2621,9 +2851,17 @@ fn discover_links_impl(root: &str) -> Result<serde_json::Value> {
 // health — comprehensive check (all logic here, TS just forwards)
 // ============================================================================
 
-async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, project_id: &str) -> Result<serde_json::Value> {
+async fn health_impl(
+    root: &str,
+    db: Option<&str>,
+    dims: u32,
+    shared: &str,
+    project_id: &str,
+) -> Result<serde_json::Value> {
     let root_path = PathBuf::from(root);
-    let storage_path = db.map(PathBuf::from).unwrap_or_else(|| crate::storage::storage_path(&root_path));
+    let storage_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::storage::storage_path(&root_path));
     let exists = tokio::fs::try_exists(&storage_path).await.unwrap_or(false);
 
     let mut result = serde_json::json!({
@@ -2647,7 +2885,7 @@ async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, proj
                     tracing::warn!("health check: metadata backfill failed: {}", e);
                 }
             }
-            
+
             let chunks = storage.count_chunks().await.unwrap_or(0);
             let files = storage.get_indexed_files().await.unwrap_or_default().len();
             let tier = storage.get_tier().await.unwrap_or(None);
@@ -2683,11 +2921,19 @@ async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, proj
         let chunks_table = storage_path.join("chunks.lance");
         let config_table = storage_path.join("config.lance");
         let mut errors: Vec<String> = Vec::new();
-        if !tokio::fs::metadata(&chunks_table).await.map(|m| m.is_dir()).unwrap_or(false) { 
-            errors.push("Missing chunks.lance table".into()); 
+        if !tokio::fs::metadata(&chunks_table)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            errors.push("Missing chunks.lance table".into());
         }
-        if !tokio::fs::metadata(&config_table).await.map(|m| m.is_dir()).unwrap_or(false) { 
-            errors.push("Missing config.lance table".into()); 
+        if !tokio::fs::metadata(&config_table)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            errors.push("Missing config.lance table".into());
         }
         if !errors.is_empty() {
             result["healthy"] = serde_json::json!(false);
@@ -2697,7 +2943,9 @@ async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, proj
 
     // Linked projects
     let root_owned = root.to_string();
-    if let Ok(Ok(links)) = tokio::task::spawn_blocking(move || discover_links_impl(&root_owned)).await {
+    if let Ok(Ok(links)) =
+        tokio::task::spawn_blocking(move || discover_links_impl(&root_owned)).await
+    {
         if let Some(arr) = links["links"].as_array() {
             let mut linked: Vec<serde_json::Value> = Vec::new();
             for link in arr {
@@ -2723,7 +2971,10 @@ async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, proj
 
     // Global memory index
     if !shared.is_empty() {
-        let global_db = PathBuf::from(shared).join("memories").join("global").join(".lancedb");
+        let global_db = PathBuf::from(shared)
+            .join("memories")
+            .join("global")
+            .join(".lancedb");
         result["globalIndex"] = serde_json::json!({
             "exists": tokio::fs::try_exists(&global_db).await.unwrap_or(false),
             "path": global_db.to_str(),
@@ -2731,7 +2982,10 @@ async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, proj
 
         // Memory dirs
         if !project_id.is_empty() {
-            let project_mem = PathBuf::from(shared).join("projects").join(project_id).join("memories");
+            let project_mem = PathBuf::from(shared)
+                .join("projects")
+                .join(project_id)
+                .join("memories");
             let global_mem = PathBuf::from(shared).join("memories").join("global");
             result["memoryDirs"] = serde_json::json!({
                 "project": project_mem.to_str(),
@@ -2748,9 +3002,15 @@ async fn health_impl(root: &str, db: Option<&str>, dims: u32, shared: &str, proj
 // ============================================================================
 
 /// Check watcher status with TUI connection count.
-fn watcher_status_with_connections(root: &str, db: Option<&str>, connection_count: usize) -> serde_json::Value {
+fn watcher_status_with_connections(
+    root: &str,
+    db: Option<&str>,
+    connection_count: usize,
+) -> serde_json::Value {
     let root_path = PathBuf::from(root);
-    let storage_path = db.map(PathBuf::from).unwrap_or_else(|| crate::storage::storage_path(&root_path));
+    let storage_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::storage::storage_path(&root_path));
 
     serde_json::json!({
         "watcherActive": false,
@@ -2765,7 +3025,7 @@ fn watcher_status_with_connections(root: &str, db: Option<&str>, connection_coun
 
 /// Startup check: auto-fix corruption and/or start watcher.
 /// All decision logic is here in the daemon - TUI just displays results.
-/// 
+///
 /// Returns JSON with:
 /// - action: "none" | "rebuilt" | "rebuilding" | "watcher_started" | "error"
 /// - message: Human-readable description
@@ -2780,21 +3040,25 @@ async fn startup_check_impl(
     dims: u32,
 ) -> serde_json::Value {
     use crate::storage;
-    
+
     let root_path = match tokio::fs::canonicalize(root).await {
         Ok(p) => p,
-        Err(e) => return serde_json::json!({
-            "action": "error",
-            "message": format!("Invalid root path: {}", e),
-            "corrupted": false,
-            "indexed": false,
-            "watching": false,
-        }),
+        Err(e) => {
+            return serde_json::json!({
+                "action": "error",
+                "message": format!("Invalid root path: {}", e),
+                "corrupted": false,
+                "indexed": false,
+                "watching": false,
+            })
+        }
     };
-    
-    let db_path = db.map(PathBuf::from).unwrap_or_else(|| storage::storage_path(&root_path));
+
+    let db_path = db
+        .map(PathBuf::from)
+        .unwrap_or_else(|| storage::storage_path(&root_path));
     let tier = tier.unwrap_or("budget");
-    
+
     // Check if db exists
     if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
         return serde_json::json!({
@@ -2805,7 +3069,7 @@ async fn startup_check_impl(
             "watching": false,
         });
     }
-    
+
     // Get status to check for corruption
     let status = match status_impl(Some(db_path.to_str().unwrap_or("")), dims).await {
         Ok(s) => s,
@@ -2817,7 +3081,7 @@ async fn startup_check_impl(
                     root_path.display(),
                     e
                 );
-                
+
                 // Clear the corrupted index
                 if let Err(clear_err) = storage::clear_corrupted_index(&db_path) {
                     return serde_json::json!({
@@ -2829,20 +3093,26 @@ async fn startup_check_impl(
                         "corruptionErrors": [e.to_string()],
                     });
                 }
-                
+
                 // Invalidate storage cache
                 invalidate_storage_cache(&db_path).await;
-                
+
                 // Spawn background rebuild: run full index then start watcher (non-blocking)
                 let state_clone = state.clone();
                 let root_str = root.to_string();
                 let db_str = db.map(|s| s.to_string());
                 let tier_str = tier.to_string();
-                
+
                 tokio::spawn(async move {
                     // First run full index
-                    let db_path = db_str.clone().map(PathBuf::from).unwrap_or_else(|| storage::storage_path(&PathBuf::from(&root_str)));
-                    tracing::info!("startup_check: starting background rebuild for {}", root_str);
+                    let db_path = db_str
+                        .clone()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| storage::storage_path(&PathBuf::from(&root_str)));
+                    tracing::info!(
+                        "startup_check: starting background rebuild for {}",
+                        root_str
+                    );
                     if let Err(e) = crate::cli::run_indexing_pub(
                         &PathBuf::from(&root_str),
                         &db_path,
@@ -2858,19 +3128,35 @@ async fn startup_check_impl(
                         None,  // scan_concurrency
                         true,  // quiet
                         false, // json_lines
-                    ).await {
+                    )
+                    .await
+                    {
                         tracing::warn!("startup_check: background indexing failed: {}", e);
                         return;
                     }
-                    tracing::info!("startup_check: background indexing completed for {}", root_str);
-                    
+                    tracing::info!(
+                        "startup_check: background indexing completed for {}",
+                        root_str
+                    );
+
                     // Then start watcher
                     let db_ref = db_str.as_deref();
-                    if let Err(rebuild_err) = watcher_start_internal(&state_clone, &root_str, db_ref, Some(&tier_str), false).await {
-                        tracing::warn!("startup_check: background watcher start failed: {}", rebuild_err);
+                    if let Err(rebuild_err) = watcher_start_internal(
+                        &state_clone,
+                        &root_str,
+                        db_ref,
+                        Some(&tier_str),
+                        false,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "startup_check: background watcher start failed: {}",
+                            rebuild_err
+                        );
                     }
                 });
-                
+
                 return serde_json::json!({
                     "action": "rebuilding",
                     "message": format!("Detected corruption ({}), cleared index and started rebuild in background", e),
@@ -2880,7 +3166,7 @@ async fn startup_check_impl(
                     "corruptionErrors": [e.to_string()],
                 });
             }
-            
+
             // Non-corruption error, return as-is
             return serde_json::json!({
                 "action": "error",
@@ -2891,22 +3177,26 @@ async fn startup_check_impl(
             });
         }
     };
-    
+
     let corrupted = status["corrupted"].as_bool().unwrap_or(false);
     let indexed = status["indexed"].as_bool().unwrap_or(false);
     let exists = status["exists"].as_bool().unwrap_or(false);
     let corruption_errors: Vec<String> = status["corruptionErrors"]
         .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    
+
     // Check if already watching
     let key = root_path.to_string_lossy().to_string();
     let already_watching = {
         let s = state.lock().await;
         s.watchers.contains_key(&key)
     };
-    
+
     // Case 1: Index is corrupted - clear and rebuild
     if corrupted {
         tracing::info!(
@@ -2914,7 +3204,7 @@ async fn startup_check_impl(
             root_path.display(),
             corruption_errors
         );
-        
+
         // Clear the corrupted index
         if let Err(e) = storage::clear_corrupted_index(&db_path) {
             return serde_json::json!({
@@ -2926,10 +3216,10 @@ async fn startup_check_impl(
                 "corruptionErrors": corruption_errors,
             });
         }
-        
+
         // Invalidate storage cache
         invalidate_storage_cache(&db_path).await;
-        
+
         // Spawn background rebuild: run full index then start watcher (non-blocking)
         // Clone values for the spawned task
         let state_clone = state.clone();
@@ -2937,10 +3227,13 @@ async fn startup_check_impl(
         let db_str = db.map(|s| s.to_string());
         let tier_str = tier.to_string();
         let db_path_clone = db_path.clone();
-        
+
         tokio::spawn(async move {
             // First run full index
-            tracing::info!("startup_check: starting background rebuild for {}", root_str);
+            tracing::info!(
+                "startup_check: starting background rebuild for {}",
+                root_str
+            );
             if let Err(e) = crate::cli::run_indexing_pub(
                 &PathBuf::from(&root_str),
                 &db_path_clone,
@@ -2956,33 +3249,55 @@ async fn startup_check_impl(
                 None,  // scan_concurrency
                 true,  // quiet
                 false, // json_lines
-            ).await {
+            )
+            .await
+            {
                 tracing::warn!("startup_check: background indexing failed: {}", e);
                 return;
             }
-            tracing::info!("startup_check: background indexing completed for {}", root_str);
-            
+            tracing::info!(
+                "startup_check: background indexing completed for {}",
+                root_str
+            );
+
             // Then start watcher (with retry)
             let db_ref = db_str.as_deref();
             let delays = WATCHER_START_RETRY_DELAYS;
             let mut started = false;
             for (attempt, &delay) in delays.iter().enumerate() {
-                match watcher_start_internal(&state_clone, &root_str, db_ref, Some(&tier_str), false).await {
-                    Ok(_) => { started = true; break; }
+                match watcher_start_internal(
+                    &state_clone,
+                    &root_str,
+                    db_ref,
+                    Some(&tier_str),
+                    false,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        started = true;
+                        break;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "startup_check: background watcher start failed (attempt {}/{}): {}",
-                            attempt + 1, delays.len(), e
+                            attempt + 1,
+                            delays.len(),
+                            e
                         );
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 }
             }
             if !started {
-                tracing::error!("startup_check: background watcher start failed after {} retries for {}", delays.len(), root_str);
+                tracing::error!(
+                    "startup_check: background watcher start failed after {} retries for {}",
+                    delays.len(),
+                    root_str
+                );
             }
         });
-        
+
         return serde_json::json!({
             "action": "rebuilding",
             "message": format!("Cleared corrupted index and started rebuild in background. Errors were: {}", corruption_errors.join(", ")),
@@ -2992,7 +3307,7 @@ async fn startup_check_impl(
             "corruptionErrors": corruption_errors,
         });
     }
-    
+
     // Case 2: Index exists, not corrupted, not watching - start watcher in background
     if exists && !already_watching {
         // Spawn watcher in background (non-blocking)
@@ -3000,28 +3315,45 @@ async fn startup_check_impl(
         let root_str = root.to_string();
         let db_str = db.map(|s| s.to_string());
         let tier_str = tier.to_string();
-        
+
         tokio::spawn(async move {
             let db_ref = db_str.as_deref();
             let delays = WATCHER_START_RETRY_DELAYS;
             let mut started = false;
             for (attempt, &delay) in delays.iter().enumerate() {
-                match watcher_start_internal(&state_clone, &root_str, db_ref, Some(&tier_str), false).await {
-                    Ok(_) => { started = true; break; }
+                match watcher_start_internal(
+                    &state_clone,
+                    &root_str,
+                    db_ref,
+                    Some(&tier_str),
+                    false,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        started = true;
+                        break;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "startup_check: background watcher_start failed (attempt {}/{}): {}",
-                            attempt + 1, delays.len(), e
+                            attempt + 1,
+                            delays.len(),
+                            e
                         );
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 }
             }
             if !started {
-                tracing::error!("startup_check: background watcher_start failed after {} retries for {}", delays.len(), root_str);
+                tracing::error!(
+                    "startup_check: background watcher_start failed after {} retries for {}",
+                    delays.len(),
+                    root_str
+                );
             }
         });
-        
+
         return serde_json::json!({
             "action": "watcher_starting",
             "message": "Starting watcher in background",
@@ -3030,7 +3362,7 @@ async fn startup_check_impl(
             "watching": false, // Not watching yet, starting in background
         });
     }
-    
+
     // Case 3: Everything is fine, nothing to do
     serde_json::json!({
         "action": "none",
@@ -3062,31 +3394,45 @@ async fn start_memory_watcher(
             return Ok(());
         }
     }
-    
-    tracing::info!("starting memory watcher for scope: {}, path: {}", scope, root.display());
-    
+
+    tracing::info!(
+        "starting memory watcher for scope: {}, path: {}",
+        scope,
+        root.display()
+    );
+
     // Create directories if they don't exist
-    tokio::fs::create_dir_all(root).await.context("failed to create memory directory")?;
-    tokio::fs::create_dir_all(db_path.parent().unwrap_or(db_path)).await.context("failed to create db directory")?;
-    
+    tokio::fs::create_dir_all(root)
+        .await
+        .context("failed to create memory directory")?;
+    tokio::fs::create_dir_all(db_path.parent().unwrap_or(db_path))
+        .await
+        .context("failed to create db directory")?;
+
     // Open or create storage
     let storage = Arc::new(crate::storage::Storage::open(db_path, dimensions).await?);
-    
+
     // Create write queue for serializing storage operations
     let write_queue = Arc::new(crate::storage::WriteQueue::new(storage.clone(), 32));
-    
+
     // Setup pending changes buffer
-    let pending: Arc<tokio::sync::Mutex<PendingChanges>> = Arc::new(tokio::sync::Mutex::new(PendingChanges::new()));
-    
+    let pending: Arc<tokio::sync::Mutex<PendingChanges>> =
+        Arc::new(tokio::sync::Mutex::new(PendingChanges::new()));
+
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    
+
     // Start the file watcher (watch for .md files in memory/activity directories)
-    let watcher_rx = watcher::watch(root, &[], &[], Arc::new(move |path: &std::path::Path| {
-        // Only watch .md files in memory/activity directories
-        path.extension().map(|e| e == "md").unwrap_or(false)
-    }))?;
-    
+    let watcher_rx = watcher::watch(
+        root,
+        &[],
+        &[],
+        Arc::new(move |path: &std::path::Path| {
+            // Only watch .md files in memory/activity directories
+            path.extension().map(|e| e == "md").unwrap_or(false)
+        }),
+    )?;
+
     // Spawn task to collect events into pending
     let pending_for_collector = pending.clone();
     let scope_for_collector = scope.to_string();
@@ -3120,35 +3466,41 @@ async fn start_memory_watcher(
             }
         }
     });
-    
+
     // Store in state
     {
         let mut s = state.lock().await;
-        s.memory_watchers.insert(scope.to_string(), MemoryWatcherState {
-            root: Arc::new(root.to_path_buf()),
-            db_path: Arc::new(db_path.to_path_buf()),
-            storage,
-            write_queue: Some(write_queue),
-            pending,
-            failed_files: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            _shutdown_tx: shutdown_tx,
-            _started_at: Instant::now(),
-            _scope: scope.to_string(),
-        });
+        s.memory_watchers.insert(
+            scope.to_string(),
+            MemoryWatcherState {
+                root: Arc::new(root.to_path_buf()),
+                db_path: Arc::new(db_path.to_path_buf()),
+                storage,
+                write_queue: Some(write_queue),
+                pending,
+                failed_files: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                _shutdown_tx: shutdown_tx,
+                _started_at: Instant::now(),
+                _scope: scope.to_string(),
+            },
+        );
     }
-    
+
     tracing::info!("memory watcher started for scope: {}", scope);
     Ok(())
 }
 
 /// Start built-in memory watchers (global memories) on daemon startup
-async fn start_builtin_memory_watchers(state: &Arc<Mutex<DaemonState>>, shared_path: &Path) -> Result<()> {
+async fn start_builtin_memory_watchers(
+    state: &Arc<Mutex<DaemonState>>,
+    shared_path: &Path,
+) -> Result<()> {
     tracing::debug!("starting built-in memory watchers");
-    
+
     // Watch global memories
     let global_memory_dir = shared_path.join("memories").join("global");
     let global_db = global_memory_dir.join(".lancedb");
-    
+
     if let Err(e) = start_memory_watcher(
         state,
         &global_memory_dir,
@@ -3156,10 +3508,12 @@ async fn start_builtin_memory_watchers(state: &Arc<Mutex<DaemonState>>, shared_p
         "global",
         "budget",
         1024,
-    ).await {
+    )
+    .await
+    {
         tracing::warn!("failed to start global memory watcher: {}", e);
     }
-    
+
     tracing::info!("built-in memory watchers started");
     Ok(())
 }
@@ -3172,15 +3526,18 @@ async fn start_project_memory_watchers(
     tier: &str,
     dimensions: u32,
 ) -> Result<()> {
-    tracing::debug!("starting project memory watchers for project_id: {}", project_id);
-    
+    tracing::debug!(
+        "starting project memory watchers for project_id: {}",
+        project_id
+    );
+
     let project_dir = shared_path.join("projects").join(project_id);
-    
+
     // Watch project memories
     let memory_dir = project_dir.join("memories");
     let memory_db = memory_dir.join(".lancedb");
     let memory_scope = format!("project:{}:memories", project_id);
-    
+
     if let Err(e) = start_memory_watcher(
         state,
         &memory_dir,
@@ -3188,15 +3545,17 @@ async fn start_project_memory_watchers(
         &memory_scope,
         tier,
         dimensions,
-    ).await {
+    )
+    .await
+    {
         tracing::warn!("failed to start project memory watcher: {}", e);
     }
-    
+
     // Watch project activity
     let activity_dir = project_dir.join("activity");
     let activity_db = activity_dir.join(".lancedb");
     let activity_scope = format!("project:{}:activity", project_id);
-    
+
     if let Err(e) = start_memory_watcher(
         state,
         &activity_dir,
@@ -3204,11 +3563,16 @@ async fn start_project_memory_watchers(
         &activity_scope,
         tier,
         dimensions,
-    ).await {
+    )
+    .await
+    {
         tracing::warn!("failed to start project activity watcher: {}", e);
     }
-    
-    tracing::info!("project memory watchers started for project_id: {}", project_id);
+
+    tracing::info!(
+        "project memory watchers started for project_id: {}",
+        project_id
+    );
     Ok(())
 }
 
@@ -3219,346 +3583,375 @@ fn watcher_start_internal<'a>(
     db: Option<&'a str>,
     tier: Option<&'a str>,
     _force: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, anyhow::Error>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, anyhow::Error>> + Send + 'a>,
+> {
     Box::pin(async move {
-    // Use consistent fallback pattern for canonicalization (matches watcher_stop, watcher_status, etc.)
-    // This ensures HashMap keys are consistent even when path can't be canonicalized.
-    let root_path = tokio::fs::canonicalize(root).await.unwrap_or_else(|_| PathBuf::from(root));
-    let key = root_path.to_string_lossy().to_string();
-    
-    // Check if already watching
-    {
-        let s = state.lock().await;
-        if s.watchers.contains_key(&key) {
+        // Use consistent fallback pattern for canonicalization (matches watcher_stop, watcher_status, etc.)
+        // This ensures HashMap keys are consistent even when path can't be canonicalized.
+        let root_path = tokio::fs::canonicalize(root)
+            .await
+            .unwrap_or_else(|_| PathBuf::from(root));
+        let key = root_path.to_string_lossy().to_string();
+
+        // Check if already watching
+        {
+            let s = state.lock().await;
+            if s.watchers.contains_key(&key) {
+                return Ok(serde_json::json!({
+                    "success": true,
+                    "started": false,
+                    "internal": true,
+                    "message": "already_watching"
+                }));
+            }
+        }
+
+        // Resolve paths
+        let db_path = if let Some(db) = db {
+            PathBuf::from(db)
+        } else {
+            crate::storage::storage_path(&root_path)
+        };
+
+        let tier = tier.unwrap_or("budget");
+
+        // === Check if project is indexed ===
+        // Watcher should NOT auto-trigger full indexing. If the project is not indexed,
+        // reject the request. Users must explicitly run /index first.
+        // Check both directory existence AND actual data — Storage::open() creates
+        // the chunks.lance directory even with 0 rows, so a directory-only check
+        // can falsely report an index as present after a failed initial run.
+        let chunks_dir = db_path.join("chunks.lance");
+        let index_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
+        let chunks_exist = tokio::fs::try_exists(&chunks_dir).await.unwrap_or(false)
+            && tokio::fs::metadata(&chunks_dir)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+
+        if !index_exists || !chunks_exist {
+            tracing::info!(
+                "watcher_start rejected: project is not indexed (db_exists={}, chunks_exist={})",
+                index_exists,
+                chunks_exist
+            );
             return Ok(serde_json::json!({
-                "success": true,
+                "success": false,
                 "started": false,
-                "internal": true,
-                "message": "already_watching"
+                "error": "project is not indexed - run /index first"
             }));
         }
-    }
-    
-    // Resolve paths
-    let db_path = if let Some(db) = db {
-        PathBuf::from(db)
-    } else {
-        crate::storage::storage_path(&root_path)
-    };
-    
-    let tier = tier.unwrap_or("budget");
-    
-    // === Check if project is indexed ===
-    // Watcher should NOT auto-trigger full indexing. If the project is not indexed,
-    // reject the request. Users must explicitly run /index first.
-    // Check both directory existence AND actual data — Storage::open() creates
-    // the chunks.lance directory even with 0 rows, so a directory-only check
-    // can falsely report an index as present after a failed initial run.
-    let chunks_dir = db_path.join("chunks.lance");
-    let index_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
-    let chunks_exist = tokio::fs::try_exists(&chunks_dir).await.unwrap_or(false) 
-        && tokio::fs::metadata(&chunks_dir).await.map(|m| m.is_dir()).unwrap_or(false);
-    
-    if !index_exists || !chunks_exist {
-        tracing::info!(
-            "watcher_start rejected: project is not indexed (db_exists={}, chunks_exist={})",
-            index_exists, chunks_exist
-        );
-        return Ok(serde_json::json!({
-            "success": false,
-            "started": false,
-            "error": "project is not indexed - run /index first"
-        }));
-    }
-    
-    // Even if chunks.lance dir exists, verify it actually has data.
-    // Storage::open creates the directory structure even when 0 files are indexed.
-    {
-        let probe = crate::storage::Storage::open(&db_path, 1024).await;
-        if let Ok(store) = probe {
-            let count = store.count_chunks().await.unwrap_or(0);
-            if count == 0 {
-                let files = store.get_indexed_files().await.unwrap_or_default().len();
-                if files == 0 {
-                    tracing::info!(
-                        "watcher_start rejected: index exists but has 0 files/chunks at {}",
-                        db_path.display()
-                    );
-                    return Ok(serde_json::json!({
-                        "success": false,
-                        "started": false,
-                        "error": "project index is empty (0 files) - run /index first"
-                    }));
-                }
-            }
-        }
-    }
-    
-    tracing::info!(
-        "index exists at {}, starting watcher",
-        db_path.display()
-    );
-    
-    // === PHASE 2: Start incremental watcher ===
-    // Read dimensions from index metadata (open with default, then read stored value)
-    let temp_storage = crate::storage::Storage::open(&db_path, 1024).await?;
-    let dimensions = temp_storage.get_dimensions().await?.unwrap_or(1024);
-    drop(temp_storage);
-    
-    // Open storage with correct dimensions
-    let storage = Arc::new(crate::storage::Storage::open(&db_path, dimensions).await?);
-    
-    // Create write queue for serializing storage operations
-    let write_queue = Arc::new(crate::storage::WriteQueue::new(storage.clone(), 100));
-    
-    // Load config for filtering and watcher settings
-    let project_config = crate::config::load(&root_path);
-    let index_cfg = crate::config::effective(&project_config, None, None);
-    let max_pending_files = project_config.watcher.max_pending_files;
-    
-    tracing::info!(
-        "watcher config: max_pending_files={} (default={})",
-        max_pending_files,
-        DEFAULT_MAX_PENDING_FILES
-    );
-    
-    // Setup pending changes buffer (with separate changed/deleted tracking)
-    let pending: Arc<tokio::sync::Mutex<PendingChanges>> = Arc::new(tokio::sync::Mutex::new(PendingChanges::new()));
-    
-    // Setup dropped event statistics for monitoring
-    let dropped_stats: Arc<tokio::sync::Mutex<DroppedEventStats>> = Arc::new(tokio::sync::Mutex::new(DroppedEventStats::default()));
-    
-    // Create shutdown channel
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    
-    // Start the notify watcher with config-based filter.
-    // Pass exclude patterns so the watcher skips heavy dirs (target/, node_modules/, etc.)
-    // at setup time rather than exhausting inotify watch limits.
-    let root_clone = root_path.clone();
-    let cfg_clone = index_cfg.clone();
-    let watcher_rx = watcher::watch(&root_path, &[], &index_cfg.exclude, Arc::new(move |path| {
-        crate::discover::should_index(path, &root_clone, &cfg_clone)
-    }))?;
-    
-    // Spawn task to collect events into pending with configurable backpressure
-    let pending_for_collector = pending.clone();
-    let dropped_stats_for_collector = dropped_stats.clone();
-    let root_for_collector = root_path.to_string_lossy().to_string();
-    let mut shutdown_rx_clone = shutdown_rx.clone();
-    tokio::spawn(async move {
-        let mut watcher_rx = watcher_rx;
-        // Log dropped event stats every 30 seconds if there were drops
-        const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
-        
-        loop {
-            tokio::select! {
-                event = watcher_rx.recv() => {
-                    match event {
-                        Some(WatchEvent::Changed(paths)) => {
-                            let mut p = pending_for_collector.lock().await;
-                            // Apply backpressure: skip if buffer too large
-                            if p.len() < max_pending_files {
-                                p.add_changed(paths);
-                            } else {
-                                let dropped_count = paths.len() as u64;
-                                drop(p); // Release pending lock before acquiring stats lock
-                                
-                                let mut stats = dropped_stats_for_collector.lock().await;
-                                stats.changed_files_dropped += dropped_count;
-                                stats.backpressure_events += 1;
-                                let now = Instant::now();
-                                stats.last_drop_time = Some(now);
-                                
-                                // Log with rate limiting to avoid spam
-                                let should_log = stats.last_log_time
-                                    .map(|t| now.duration_since(t) >= STATS_LOG_INTERVAL)
-                                    .unwrap_or(true);
-                                
-                                if should_log {
-                                    tracing::warn!(
-                                        project = %root_for_collector,
-                                        dropped = dropped_count,
-                                        total_changed_dropped = stats.changed_files_dropped,
-                                        total_deleted_dropped = stats.deleted_files_dropped,
-                                        backpressure_events = stats.backpressure_events,
-                                        buffer_limit = max_pending_files,
-                                        "pending buffer full - dropping changed files (consider increasing watcher.max_pending_files in .opencode-index.yaml)"
-                                    );
-                                    stats.last_log_time = Some(now);
-                                }
-                            }
-                        }
-                        Some(WatchEvent::Deleted(paths)) => {
-                            let mut p = pending_for_collector.lock().await;
-                            if p.len() < max_pending_files {
-                                p.add_deleted(paths);
-                            } else {
-                                let dropped_count = paths.len() as u64;
-                                drop(p); // Release pending lock before acquiring stats lock
-                                
-                                let mut stats = dropped_stats_for_collector.lock().await;
-                                stats.deleted_files_dropped += dropped_count;
-                                stats.backpressure_events += 1;
-                                let now = Instant::now();
-                                stats.last_drop_time = Some(now);
-                                
-                                // Log with rate limiting to avoid spam
-                                let should_log = stats.last_log_time
-                                    .map(|t| now.duration_since(t) >= STATS_LOG_INTERVAL)
-                                    .unwrap_or(true);
-                                
-                                if should_log {
-                                    tracing::warn!(
-                                        project = %root_for_collector,
-                                        dropped = dropped_count,
-                                        total_changed_dropped = stats.changed_files_dropped,
-                                        total_deleted_dropped = stats.deleted_files_dropped,
-                                        backpressure_events = stats.backpressure_events,
-                                        buffer_limit = max_pending_files,
-                                        "pending buffer full - dropping deleted files (consider increasing watcher.max_pending_files in .opencode-index.yaml)"
-                                    );
-                                    stats.last_log_time = Some(now);
-                                }
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = shutdown_rx_clone.changed() => {
-                    if *shutdown_rx_clone.borrow() {
-                        // Log final stats on shutdown if any drops occurred
-                        let stats = dropped_stats_for_collector.lock().await;
-                        if stats.backpressure_events > 0 {
-                            tracing::info!(
-                                project = %root_for_collector,
-                                total_changed_dropped = stats.changed_files_dropped,
-                                total_deleted_dropped = stats.deleted_files_dropped,
-                                backpressure_events = stats.backpressure_events,
-                                "watcher shutdown - final dropped event statistics"
-                            );
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    
-    // Create watcher state
-    let watcher_state = WatcherState {
-        root: Arc::new(root_path.clone()),
-        db_path: Arc::new(db_path.clone()),
-        storage,
-        write_queue: Some(write_queue),
-        include_dirs: Arc::new(vec![]),
-        symlink_dirs: Arc::new(vec![]),
-        pending,
-        tier: Arc::from(tier),
-        dimensions,
-        ops_since_compact: 0,
-        _watcher_handle: None,
-        shutdown_tx,
-        max_pending_files,
-        dropped_stats,
-        started_at: Instant::now(),
-    };
-    
-    // Insert into state
-    {
-        let mut s = state.lock().await;
-        s.watchers.insert(key.clone(), watcher_state);
-    }
-    
-    tracing::info!("started internal watcher for {}", root);
-    
-    // Trigger linked project indexing in background after watcher starts.
-    // This ensures linked projects get indexed automatically when a watcher starts,
-    // not only when the user explicitly runs /index.
-    {
-        let root_for_links = root.to_string();
-        let tier_for_links = tier.to_string();
-        let dims_for_links = dimensions;
-        tokio::spawn(async move {
-            // Small delay to let the watcher fully initialize
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let links = tokio::task::spawn_blocking({
-                let root = root_for_links.clone();
-                move || cached_discover_links(&root)
-            })
-            .await
-            .unwrap_or_default();
-            if !links.is_empty() {
-                tracing::info!(
-                    "auto-indexing {} linked projects after watcher start",
-                    links.len()
-                );
-                for link in links {
-                    ensure_link_index(link, &tier_for_links, dims_for_links, &root_for_links).await;
-                }
-            }
-        });
-    }
-    // After linked project indexing, start watchers for linked projects via dispatch_unified.
-    // Using dispatch_unified (not watcher_start_internal directly) avoids recursive async
-    // type inference issues that make tokio::spawn require Send.
-    {
-        let root_for_links = root.to_string();
-        let tier_for_links = tier.to_string();
-        let state_for_links = state.clone();
-        tokio::spawn(async move {
-            // Wait for indexing to complete (2s init + indexing time + buffer)
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            // Collect (repo, db) pairs synchronously; filter by existing index
-            let pairs: Vec<(String, String)> = tokio::task::spawn_blocking({
-                let root = root_for_links.clone();
-                move || {
-                    cached_discover_links(&root)
-                        .into_iter()
-                        .filter(|l| l.db.join("chunks.lance").exists())
-                        .map(|l| (l.repo.to_string_lossy().to_string(), l.db.to_string_lossy().to_string()))
-                        .collect()
-                }
-            })
-            .await
-            .unwrap_or_default();
-            for (repo, db) in pairs {
-                let result = dispatch_unified(
-                    state_for_links.clone(),
-                    "watcher_start".to_string(),
-                    serde_json::json!({ "root": repo, "db": db, "tier": tier_for_links }),
-                ).await;
-                if result["started"].as_bool().unwrap_or(false) {
-                    tracing::info!("started watcher for linked project: {}", db);
-                } else if result["message"].as_str() == Some("already_watching") {
-                    tracing::debug!("watcher already running for linked project: {}", db);
-                } else if result["success"].as_bool() == Some(false) {
-                    tracing::debug!("watcher_start for linked project {}: {:?}", db, result);
-                }
-            }
-        });
-    }
 
-    // Start project memory and activity watchers in background
-    // Extract project_id from root path for memory/activity directories
-    let project_id = crate::storage::git_project_id(&root_path);
-    if let Some(shared) = dirs::data_local_dir() {
-        let shared = shared.join("opencode");
-        let state_for_mem = state.clone();
-        let tier_for_mem = tier.to_string();
+        // Even if chunks.lance dir exists, verify it actually has data.
+        // Storage::open creates the directory structure even when 0 files are indexed.
+        {
+            let probe = crate::storage::Storage::open(&db_path, 1024).await;
+            if let Ok(store) = probe {
+                let count = store.count_chunks().await.unwrap_or(0);
+                if count == 0 {
+                    let files = store.get_indexed_files().await.unwrap_or_default().len();
+                    if files == 0 {
+                        tracing::info!(
+                            "watcher_start rejected: index exists but has 0 files/chunks at {}",
+                            db_path.display()
+                        );
+                        return Ok(serde_json::json!({
+                            "success": false,
+                            "started": false,
+                            "error": "project index is empty (0 files) - run /index first"
+                        }));
+                    }
+                }
+            }
+        }
+
+        tracing::info!("index exists at {}, starting watcher", db_path.display());
+
+        // === PHASE 2: Start incremental watcher ===
+        // Read dimensions from index metadata (open with default, then read stored value)
+        let temp_storage = crate::storage::Storage::open(&db_path, 1024).await?;
+        let dimensions = temp_storage.get_dimensions().await?.unwrap_or(1024);
+        drop(temp_storage);
+
+        // Open storage with correct dimensions
+        let storage = Arc::new(crate::storage::Storage::open(&db_path, dimensions).await?);
+
+        // Create write queue for serializing storage operations
+        let write_queue = Arc::new(crate::storage::WriteQueue::new(storage.clone(), 100));
+
+        // Load config for filtering and watcher settings
+        let project_config = crate::config::load(&root_path);
+        let index_cfg = crate::config::effective(&project_config, None, None);
+        let max_pending_files = project_config.watcher.max_pending_files;
+
+        tracing::info!(
+            "watcher config: max_pending_files={} (default={})",
+            max_pending_files,
+            DEFAULT_MAX_PENDING_FILES
+        );
+
+        // Setup pending changes buffer (with separate changed/deleted tracking)
+        let pending: Arc<tokio::sync::Mutex<PendingChanges>> =
+            Arc::new(tokio::sync::Mutex::new(PendingChanges::new()));
+
+        // Setup dropped event statistics for monitoring
+        let dropped_stats: Arc<tokio::sync::Mutex<DroppedEventStats>> =
+            Arc::new(tokio::sync::Mutex::new(DroppedEventStats::default()));
+
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Start the notify watcher with config-based filter.
+        // Pass exclude patterns so the watcher skips heavy dirs (target/, node_modules/, etc.)
+        // at setup time rather than exhausting inotify watch limits.
+        let root_clone = root_path.clone();
+        let cfg_clone = index_cfg.clone();
+        let watcher_rx = watcher::watch(
+            &root_path,
+            &[],
+            &index_cfg.exclude,
+            Arc::new(move |path| crate::discover::should_index(path, &root_clone, &cfg_clone)),
+        )?;
+
+        // Spawn task to collect events into pending with configurable backpressure
+        let pending_for_collector = pending.clone();
+        let dropped_stats_for_collector = dropped_stats.clone();
+        let root_for_collector = root_path.to_string_lossy().to_string();
+        let mut shutdown_rx_clone = shutdown_rx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Err(e) = start_project_memory_watchers(&state_for_mem, &shared, &project_id, &tier_for_mem, dimensions).await {
-                tracing::debug!("failed to start project memory watchers for {}: {}", project_id, e);
+            let mut watcher_rx = watcher_rx;
+            // Log dropped event stats every 30 seconds if there were drops
+            const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+            loop {
+                tokio::select! {
+                    event = watcher_rx.recv() => {
+                        match event {
+                            Some(WatchEvent::Changed(paths)) => {
+                                let mut p = pending_for_collector.lock().await;
+                                // Apply backpressure: skip if buffer too large
+                                if p.len() < max_pending_files {
+                                    p.add_changed(paths);
+                                } else {
+                                    let dropped_count = paths.len() as u64;
+                                    drop(p); // Release pending lock before acquiring stats lock
+
+                                    let mut stats = dropped_stats_for_collector.lock().await;
+                                    stats.changed_files_dropped += dropped_count;
+                                    stats.backpressure_events += 1;
+                                    let now = Instant::now();
+                                    stats.last_drop_time = Some(now);
+
+                                    // Log with rate limiting to avoid spam
+                                    let should_log = stats.last_log_time
+                                        .map(|t| now.duration_since(t) >= STATS_LOG_INTERVAL)
+                                        .unwrap_or(true);
+
+                                    if should_log {
+                                        tracing::warn!(
+                                            project = %root_for_collector,
+                                            dropped = dropped_count,
+                                            total_changed_dropped = stats.changed_files_dropped,
+                                            total_deleted_dropped = stats.deleted_files_dropped,
+                                            backpressure_events = stats.backpressure_events,
+                                            buffer_limit = max_pending_files,
+                                            "pending buffer full - dropping changed files (consider increasing watcher.max_pending_files in .opencode-index.yaml)"
+                                        );
+                                        stats.last_log_time = Some(now);
+                                    }
+                                }
+                            }
+                            Some(WatchEvent::Deleted(paths)) => {
+                                let mut p = pending_for_collector.lock().await;
+                                if p.len() < max_pending_files {
+                                    p.add_deleted(paths);
+                                } else {
+                                    let dropped_count = paths.len() as u64;
+                                    drop(p); // Release pending lock before acquiring stats lock
+
+                                    let mut stats = dropped_stats_for_collector.lock().await;
+                                    stats.deleted_files_dropped += dropped_count;
+                                    stats.backpressure_events += 1;
+                                    let now = Instant::now();
+                                    stats.last_drop_time = Some(now);
+
+                                    // Log with rate limiting to avoid spam
+                                    let should_log = stats.last_log_time
+                                        .map(|t| now.duration_since(t) >= STATS_LOG_INTERVAL)
+                                        .unwrap_or(true);
+
+                                    if should_log {
+                                        tracing::warn!(
+                                            project = %root_for_collector,
+                                            dropped = dropped_count,
+                                            total_changed_dropped = stats.changed_files_dropped,
+                                            total_deleted_dropped = stats.deleted_files_dropped,
+                                            backpressure_events = stats.backpressure_events,
+                                            buffer_limit = max_pending_files,
+                                            "pending buffer full - dropping deleted files (consider increasing watcher.max_pending_files in .opencode-index.yaml)"
+                                        );
+                                        stats.last_log_time = Some(now);
+                                    }
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = shutdown_rx_clone.changed() => {
+                        if *shutdown_rx_clone.borrow() {
+                            // Log final stats on shutdown if any drops occurred
+                            let stats = dropped_stats_for_collector.lock().await;
+                            if stats.backpressure_events > 0 {
+                                tracing::info!(
+                                    project = %root_for_collector,
+                                    total_changed_dropped = stats.changed_files_dropped,
+                                    total_deleted_dropped = stats.deleted_files_dropped,
+                                    backpressure_events = stats.backpressure_events,
+                                    "watcher shutdown - final dropped event statistics"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         });
-    }
-    
-    Ok(serde_json::json!({
-        "success": true,
-        "started": true,
-        "internal": true,
-        "dbPath": db_path.to_string_lossy(),
-    }))
+
+        // Create watcher state
+        let watcher_state = WatcherState {
+            root: Arc::new(root_path.clone()),
+            db_path: Arc::new(db_path.clone()),
+            storage,
+            write_queue: Some(write_queue),
+            include_dirs: Arc::new(vec![]),
+            symlink_dirs: Arc::new(vec![]),
+            pending,
+            tier: Arc::from(tier),
+            dimensions,
+            ops_since_compact: 0,
+            _watcher_handle: None,
+            shutdown_tx,
+            max_pending_files,
+            dropped_stats,
+            started_at: Instant::now(),
+        };
+
+        // Insert into state
+        {
+            let mut s = state.lock().await;
+            s.watchers.insert(key.clone(), watcher_state);
+        }
+
+        tracing::info!("started internal watcher for {}", root);
+
+        // Trigger linked project indexing in background after watcher starts.
+        // This ensures linked projects get indexed automatically when a watcher starts,
+        // not only when the user explicitly runs /index.
+        {
+            let root_for_links = root.to_string();
+            let tier_for_links = tier.to_string();
+            let dims_for_links = dimensions;
+            tokio::spawn(async move {
+                // Small delay to let the watcher fully initialize
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let links = tokio::task::spawn_blocking({
+                    let root = root_for_links.clone();
+                    move || cached_discover_links(&root)
+                })
+                .await
+                .unwrap_or_default();
+                if !links.is_empty() {
+                    tracing::info!(
+                        "auto-indexing {} linked projects after watcher start",
+                        links.len()
+                    );
+                    for link in links {
+                        ensure_link_index(link, &tier_for_links, dims_for_links, &root_for_links)
+                            .await;
+                    }
+                }
+            });
+        }
+        // After linked project indexing, start watchers for linked projects via dispatch_unified.
+        // Using dispatch_unified (not watcher_start_internal directly) avoids recursive async
+        // type inference issues that make tokio::spawn require Send.
+        {
+            let root_for_links = root.to_string();
+            let tier_for_links = tier.to_string();
+            let state_for_links = state.clone();
+            tokio::spawn(async move {
+                // Wait for indexing to complete (2s init + indexing time + buffer)
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                // Collect (repo, db) pairs synchronously; filter by existing index
+                let pairs: Vec<(String, String)> = tokio::task::spawn_blocking({
+                    let root = root_for_links.clone();
+                    move || {
+                        cached_discover_links(&root)
+                            .into_iter()
+                            .filter(|l| l.db.join("chunks.lance").exists())
+                            .map(|l| {
+                                (
+                                    l.repo.to_string_lossy().to_string(),
+                                    l.db.to_string_lossy().to_string(),
+                                )
+                            })
+                            .collect()
+                    }
+                })
+                .await
+                .unwrap_or_default();
+                for (repo, db) in pairs {
+                    let result = dispatch_unified(
+                        state_for_links.clone(),
+                        "watcher_start".to_string(),
+                        serde_json::json!({ "root": repo, "db": db, "tier": tier_for_links }),
+                    )
+                    .await;
+                    if result["started"].as_bool().unwrap_or(false) {
+                        tracing::info!("started watcher for linked project: {}", db);
+                    } else if result["message"].as_str() == Some("already_watching") {
+                        tracing::debug!("watcher already running for linked project: {}", db);
+                    } else if result["success"].as_bool() == Some(false) {
+                        tracing::debug!("watcher_start for linked project {}: {:?}", db, result);
+                    }
+                }
+            });
+        }
+
+        // Start project memory and activity watchers in background
+        // Extract project_id from root path for memory/activity directories
+        let project_id = crate::storage::git_project_id(&root_path);
+        if let Some(shared) = dirs::data_local_dir() {
+            let shared = shared.join("opencode");
+            let state_for_mem = state.clone();
+            let tier_for_mem = tier.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Err(e) = start_project_memory_watchers(
+                    &state_for_mem,
+                    &shared,
+                    &project_id,
+                    &tier_for_mem,
+                    dimensions,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        "failed to start project memory watchers for {}: {}",
+                        project_id,
+                        e
+                    );
+                }
+            });
+        }
+
+        Ok(serde_json::json!({
+            "success": true,
+            "started": true,
+            "internal": true,
+            "dbPath": db_path.to_string_lossy(),
+        }))
     })
 }
 
@@ -3568,10 +3961,10 @@ async fn watcher_stop_internal(
     root: &str,
 ) -> Result<serde_json::Value, anyhow::Error> {
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-    
+
     // Use canonicalize_project_key for consistent HashMap lookups
     let key = canonicalize_project_key(root).await;
-    
+
     // Signal shutdown first
     {
         let s = state.lock().await;
@@ -3585,10 +3978,10 @@ async fn watcher_stop_internal(
             }));
         }
     }
-    
+
     // Wait briefly for processing to settle
     tokio::time::sleep(Duration::from_millis(100)).await;
-    
+
     // Drain WriteQueue before removing watcher
     {
         let mut s = state.lock().await;
@@ -3597,23 +3990,32 @@ async fn watcher_stop_internal(
                 Ok(Some(stats)) => {
                     tracing::info!(
                         "Watcher {}: drained WriteQueue ({} batches, {} chunks written)",
-                        root, stats.batches_written, stats.chunks_written
+                        root,
+                        stats.batches_written,
+                        stats.chunks_written
                     );
                 }
                 Ok(None) => {
-                    tracing::warn!("Watcher {}: WriteQueue already drained or has other references", root);
+                    tracing::warn!(
+                        "Watcher {}: WriteQueue already drained or has other references",
+                        root
+                    );
                 }
                 Err(_) => {
-                    tracing::warn!("Watcher {}: WriteQueue drain timed out after {:?}", root, DRAIN_TIMEOUT);
+                    tracing::warn!(
+                        "Watcher {}: WriteQueue drain timed out after {:?}",
+                        root,
+                        DRAIN_TIMEOUT
+                    );
                 }
             }
         }
     }
-    
+
     // Now remove the watcher
     let mut s = state.lock().await;
     let removed = s.watchers.remove(&key).is_some();
-    
+
     if removed {
         tracing::info!("stopped internal watcher for {}", root);
         Ok(serde_json::json!({
@@ -3636,16 +4038,17 @@ async fn watcher_stop_internal(
 
 /// Register a TUI connection for a project.
 /// Returns the current connection count for that project.
-fn tui_connect_impl(
-    state: &mut DaemonState,
-    key: &str,
-    connection_id: &str,
-) -> serde_json::Value {
+fn tui_connect_impl(state: &mut DaemonState, key: &str, connection_id: &str) -> serde_json::Value {
     state.tui_projects.insert(key.to_string());
     let connections = state.tui_connections.entry(key.to_string()).or_default();
     connections.insert(connection_id.to_string());
     let count = connections.len();
-    tracing::info!("TUI connected: {} (project: {}, total: {})", connection_id, key, count);
+    tracing::info!(
+        "TUI connected: {} (project: {}, total: {})",
+        connection_id,
+        key,
+        count
+    );
     serde_json::json!({
         "success": true,
         "connectionId": connection_id,
@@ -3672,12 +4075,15 @@ fn tui_disconnect_impl(
             should_stop_watcher = true;
         }
     }
-    
+
     tracing::info!(
         "TUI disconnected: {} (project: {}, remaining: {}, stop_watcher: {})",
-        connection_id, key, count, should_stop_watcher
+        connection_id,
+        key,
+        count,
+        should_stop_watcher
     );
-    
+
     serde_json::json!({
         "success": true,
         "connectionId": connection_id,
@@ -3689,17 +4095,13 @@ fn tui_disconnect_impl(
 
 /// Get current TUI connection status for a project.
 fn tui_connections_impl(state: &mut DaemonState, key: &str) -> serde_json::Value {
-    let count = state
-        .tui_connections
-        .get(key)
-        .map(|c| c.len())
-        .unwrap_or(0);
+    let count = state.tui_connections.get(key).map(|c| c.len()).unwrap_or(0);
     let connections: Vec<&String> = state
         .tui_connections
         .get(key)
         .map(|c| c.iter().collect())
         .unwrap_or_default();
-    
+
     serde_json::json!({
         "project": key,
         "connectionCount": count,
@@ -3716,23 +4118,28 @@ async fn canonicalize_project_key(root: &str) -> String {
             return cached.clone();
         }
     }
-    
+
     // Slow path: async canonicalize and cache
-    let canonical = tokio::fs::canonicalize(root).await
+    let canonical = tokio::fs::canonicalize(root)
+        .await
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| root.to_string());
-    
+
     {
         let mut cache = canonicalized_paths_cache().write().await;
         if cache.len() >= MAX_CANONICALIZED_CACHE_SIZE {
-            let keys: Vec<_> = cache.keys().take(MAX_CANONICALIZED_CACHE_SIZE / 2).cloned().collect();
+            let keys: Vec<_> = cache
+                .keys()
+                .take(MAX_CANONICALIZED_CACHE_SIZE / 2)
+                .cloned()
+                .collect();
             for k in keys {
                 cache.remove(&k);
             }
         }
         cache.insert(root.to_string(), canonical.clone());
     }
-    
+
     canonical
 }
 
@@ -3775,7 +4182,9 @@ fn spawn_project_processor(key: String, state: Arc<Mutex<DaemonState>>) {
                     let db = params["db"].as_str();
                     let dims = params["dimensions"].as_u64().unwrap_or(1024) as u32;
 
-                    let root_path = tokio::fs::canonicalize(root).await.unwrap_or_else(|_| PathBuf::from(root));
+                    let root_path = tokio::fs::canonicalize(root)
+                        .await
+                        .unwrap_or_else(|_| PathBuf::from(root));
                     let storage_path = db
                         .map(PathBuf::from)
                         .unwrap_or_else(|| crate::storage::storage_path(&root_path));
@@ -3796,12 +4205,16 @@ fn spawn_project_processor(key: String, state: Arc<Mutex<DaemonState>>) {
 }
 
 // ============================================================================
-// Unified dispatcher (shared by Unix socket and HTTP server)
+// Unified dispatcher for HTTP server
 // ============================================================================
 
 /// Opaque dispatcher passed to the HTTP server.
 pub type Dispatcher = Arc<
-    dyn Fn(String, serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>
+    dyn Fn(
+            String,
+            serde_json::Value,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>
         + Send
         + Sync,
 >;
@@ -3809,7 +4222,7 @@ pub type Dispatcher = Arc<
 /// Route one RPC call to the correct handler, including stateful methods.
 ///
 /// Mirrors the per-connection dispatch logic in `run()` so that both the
-/// Unix socket and HTTP transports share exactly the same business logic.
+/// HTTP transport business logic.
 async fn dispatch_unified(
     state: Arc<Mutex<DaemonState>>,
     method: String,
@@ -3855,7 +4268,10 @@ async fn dispatch_unified(
         let key = canonicalize_project_key(root).await;
         let can_stop = {
             let s = state.lock().await;
-            s.tui_connections.get(&key).map(|c| c.is_empty()).unwrap_or(true)
+            s.tui_connections
+                .get(&key)
+                .map(|c| c.is_empty())
+                .unwrap_or(true)
         };
         return if can_stop {
             watcher_stop_internal(&state, root)
@@ -3899,13 +4315,20 @@ async fn dispatch_unified(
         };
     }
 
-    if matches!(method.as_str(), "tui_connect" | "tui_disconnect" | "tui_connections") {
+    if matches!(
+        method.as_str(),
+        "tui_connect" | "tui_disconnect" | "tui_connections"
+    ) {
         let root = params["root"].as_str().unwrap_or(".");
         let key = canonicalize_project_key(root).await;
         let mut s = state.lock().await;
         return match method.as_str() {
-            "tui_connect" => tui_connect_impl(&mut s, &key, params["connectionId"].as_str().unwrap_or("")),
-            "tui_disconnect" => tui_disconnect_impl(&mut s, &key, params["connectionId"].as_str().unwrap_or("")),
+            "tui_connect" => {
+                tui_connect_impl(&mut s, &key, params["connectionId"].as_str().unwrap_or(""))
+            }
+            "tui_disconnect" => {
+                tui_disconnect_impl(&mut s, &key, params["connectionId"].as_str().unwrap_or(""))
+            }
             "tui_connections" => tui_connections_impl(&mut s, &key),
             _ => unreachable!(),
         };
@@ -3917,11 +4340,19 @@ async fn dispatch_unified(
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut s = state.lock().await;
-            let pq = s.projects.entry(key.clone()).or_insert_with(|| ProjectQueue {
-                queue: VecDeque::new(),
-                processing: false,
+            let pq = s
+                .projects
+                .entry(key.clone())
+                .or_insert_with(|| ProjectQueue {
+                    queue: VecDeque::new(),
+                    processing: false,
+                });
+            pq.queue.push_back(QueueItem {
+                id: 0,
+                method: method.clone(),
+                params: params.clone(),
+                tx,
             });
-            pq.queue.push_back(QueueItem { id: 0, method: method.clone(), params: params.clone(), tx });
             if !pq.processing {
                 pq.processing = true;
                 spawn_project_processor(key, state.clone());
@@ -3996,8 +4427,8 @@ pub async fn run(port: u16) -> Result<()> {
     let lock_dir = home.join(".opencode");
     tokio::fs::create_dir_all(&lock_dir).await.ok();
     let lock_path = lock_dir.join("indexer.lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .context("failed to create indexer lock file")?;
+    let lock_file =
+        std::fs::File::create(&lock_path).context("failed to create indexer lock file")?;
 
     #[cfg(unix)]
     {
@@ -4009,14 +4440,20 @@ pub async fn run(port: u16) -> Result<()> {
             // Another daemon holds the lock — check if it's responsive
             if let Some(existing) = check_existing_daemon().await {
                 tracing::info!("daemon already running on port {}, exiting", existing);
-                println!("{}", serde_json::json!({"type": "already_running", "port": existing}));
+                println!(
+                    "{}",
+                    serde_json::json!({"type": "already_running", "port": existing})
+                );
                 return Ok(());
             }
             // Lock held but daemon not responsive — stale lock, try blocking acquire
             tracing::warn!("stale lock detected, waiting to acquire...");
             let locked = unsafe { libc::flock(fd, libc::LOCK_EX) };
             if locked != 0 {
-                anyhow::bail!("failed to acquire indexer lock: {}", std::io::Error::last_os_error());
+                anyhow::bail!(
+                    "failed to acquire indexer lock: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }
@@ -4027,7 +4464,10 @@ pub async fn run(port: u16) -> Result<()> {
     // --- Secondary check: HTTP probe ---
     if let Some(existing) = check_existing_daemon().await {
         tracing::info!("daemon already running on port {}, exiting", existing);
-        println!("{}", serde_json::json!({"type": "already_running", "port": existing}));
+        println!(
+            "{}",
+            serde_json::json!({"type": "already_running", "port": existing})
+        );
         return Ok(());
     }
 
@@ -4057,7 +4497,8 @@ pub async fn run(port: u16) -> Result<()> {
     }));
 
     // Create compaction queue and spawn worker
-    let (compaction_tx, compaction_rx) = tokio::sync::mpsc::channel::<CompactionRequest>(COMPACTION_QUEUE_SIZE);
+    let (compaction_tx, compaction_rx) =
+        tokio::sync::mpsc::channel::<CompactionRequest>(COMPACTION_QUEUE_SIZE);
     {
         let state = state.clone();
         let shutdown_rx = shutdown_rx.clone();
@@ -4088,9 +4529,11 @@ pub async fn run(port: u16) -> Result<()> {
                 ticker.tick().await;
                 let roots: Vec<String> = {
                     let mut s = state.lock().await;
-                    
+
                     // Collect stale projects for cleanup
-                    let stale_projects: Vec<String> = s.projects.iter()
+                    let stale_projects: Vec<String> = s
+                        .projects
+                        .iter()
                         .filter(|(project_key, queue)| {
                             // Project is stale if:
                             // 1. Not in tui_projects (no TUI ever connected)
@@ -4101,18 +4544,24 @@ pub async fn run(port: u16) -> Result<()> {
                         })
                         .map(|(k, _)| k.clone())
                         .collect();
-                    
+
                     // Remove stale projects
                     for project_key in &stale_projects {
                         if let Some(_) = s.projects.remove(project_key) {
                             tracing::debug!("cleaned up stale project queue: {}", project_key);
                         }
                     }
-                    
+
                     // Collect roots that need watcher stopped
                     s.tui_projects
                         .iter()
-                        .filter(|root| s.tui_connections.get(*root).map(|c| !c.is_empty()).unwrap_or(false) == false)
+                        .filter(|root| {
+                            s.tui_connections
+                                .get(*root)
+                                .map(|c| !c.is_empty())
+                                .unwrap_or(false)
+                                == false
+                        })
                         .cloned()
                         .collect()
                 };
@@ -4137,7 +4586,9 @@ pub async fn run(port: u16) -> Result<()> {
                     {
                         let mut s = state.lock().await;
                         if let Some(watcher) = s.watchers.get_mut(&key) {
-                            match tokio::time::timeout(drain_timeout, watcher.drain_write_queue()).await {
+                            match tokio::time::timeout(drain_timeout, watcher.drain_write_queue())
+                                .await
+                            {
                                 Ok(Some(stats)) => {
                                     tracing::info!(
                                         "Watcher {}: drained WriteQueue ({} batches, {} chunks written)",
@@ -4148,7 +4599,11 @@ pub async fn run(port: u16) -> Result<()> {
                                     tracing::warn!("Watcher {}: WriteQueue already drained or has other references", root);
                                 }
                                 Err(_) => {
-                                    tracing::warn!("Watcher {}: WriteQueue drain timed out after {:?}", root, drain_timeout);
+                                    tracing::warn!(
+                                        "Watcher {}: WriteQueue drain timed out after {:?}",
+                                        root,
+                                        drain_timeout
+                                    );
                                 }
                             }
                         }
@@ -4157,7 +4612,10 @@ pub async fn run(port: u16) -> Result<()> {
                     // Now remove the watcher and tui_projects entry
                     let mut s = state.lock().await;
                     if s.watchers.remove(&key).is_some() {
-                        tracing::info!("stopped internal watcher for {} (no TUI connections)", root);
+                        tracing::info!(
+                            "stopped internal watcher for {} (no TUI connections)",
+                            root
+                        );
                     }
                     s.tui_projects.remove(&key);
                 }
@@ -4196,7 +4654,9 @@ pub async fn run(port: u16) -> Result<()> {
             };
 
             // Watch shared_data_dir/ for aux dir events (backups/, compaction-history/, etc.)
-            if let Err(e) = notify::Watcher::watch(&mut watcher, &base, notify::RecursiveMode::NonRecursive) {
+            if let Err(e) =
+                notify::Watcher::watch(&mut watcher, &base, notify::RecursiveMode::NonRecursive)
+            {
                 tracing::warn!("cleanup watcher: failed to watch base dir: {}", e);
             }
 
@@ -4205,7 +4665,9 @@ pub async fn run(port: u16) -> Result<()> {
             if !projects.exists() {
                 let _ = std::fs::create_dir_all(&projects);
             }
-            if let Err(e) = notify::Watcher::watch(&mut watcher, &projects, notify::RecursiveMode::NonRecursive) {
+            if let Err(e) =
+                notify::Watcher::watch(&mut watcher, &projects, notify::RecursiveMode::NonRecursive)
+            {
                 tracing::warn!("cleanup watcher: failed to watch projects dir: {}", e);
             }
 
@@ -4255,7 +4717,8 @@ pub async fn run(port: u16) -> Result<()> {
                 tracing::info!("running project cleanup");
                 let c = cfg.clone();
                 let b = base.clone();
-                match tokio::task::spawn_blocking(move || crate::cleaner::run(&b, &c, false)).await {
+                match tokio::task::spawn_blocking(move || crate::cleaner::run(&b, &c, false)).await
+                {
                     Ok(report) => {
                         if report.orphans > 0 || report.stale > 0 || report.aux_dirs > 0 {
                             tracing::info!(
@@ -4282,38 +4745,49 @@ pub async fn run(port: u16) -> Result<()> {
             // Minimum batch interval to avoid thrashing
             // Use 500ms (not 200ms) to reduce CPU wakeups in continuous loop
             let min_batch_interval = Duration::from_millis(500);
-            
+
             loop {
                 // Wait for any watcher to have pending changes OR timeout for periodic check
                 // Use 60s timeout to minimize idle wakeups while still allowing periodic checks
                 let had_pending = tokio::time::timeout(
                     Duration::from_secs(300), // 5-minute timeout - watcher events wake us immediately
-                    wait_for_any_pending(&state)
-                ).await.is_ok(); // true if we got notified, false if timeout
-                
+                    wait_for_any_pending(&state),
+                )
+                .await
+                .is_ok(); // true if we got notified, false if timeout
+
                 // Check shutdown
                 if *shutdown_rx.borrow() {
                     tracing::info!("watcher processor received shutdown");
                     break;
                 }
-                
+
                 // If timeout expired without notification, skip processing entirely
                 // This avoids expensive watcher iteration when idle
                 if !had_pending {
                     continue;
                 }
-                
+
                 // Add batching delay to coalesce rapid changes
                 tokio::time::sleep(min_batch_interval).await;
-                
+
                 // Get all watcher keys in one lock
-                let keys: Vec<String> = {
-                    state.lock().await.watchers.keys().cloned().collect()
-                };
-                
+                let keys: Vec<String> = { state.lock().await.watchers.keys().cloned().collect() };
+
                 for key in keys {
                     // Drain pending paths (separate changed/deleted)
-                    let (changed, deleted, storage, write_queue, root, include_dirs, symlink_dirs, tier, dims, db_path) = {
+                    let (
+                        changed,
+                        deleted,
+                        storage,
+                        write_queue,
+                        root,
+                        include_dirs,
+                        symlink_dirs,
+                        tier,
+                        dims,
+                        db_path,
+                    ) = {
                         let mut s = state.lock().await;
                         if let Some(w) = s.watchers.get_mut(&key) {
                             let mut pending = w.pending.lock().await;
@@ -4322,42 +4796,54 @@ pub async fn run(port: u16) -> Result<()> {
                             }
                             // Skip if write_queue is drained
                             let Some(wq) = w.write_queue.as_ref() else {
-                                tracing::warn!("write_queue drained for {}, skipping pending changes", key);
+                                tracing::warn!(
+                                    "write_queue drained for {}, skipping pending changes",
+                                    key
+                                );
                                 continue;
                             };
                             let (changed, deleted) = pending.drain();
                             (
                                 changed,
                                 deleted,
-                                w.storage.clone(),        // Arc clone
-                                wq.clone(),               // Arc clone
-                                w.root.clone(),           // Arc clone (cheap)
-                                w.include_dirs.clone(),   // Arc clone (cheap)
-                                w.symlink_dirs.clone(),   // Arc clone (cheap)
-                                w.tier.clone(),           // Arc clone (cheap)
+                                w.storage.clone(),      // Arc clone
+                                wq.clone(),             // Arc clone
+                                w.root.clone(),         // Arc clone (cheap)
+                                w.include_dirs.clone(), // Arc clone (cheap)
+                                w.symlink_dirs.clone(), // Arc clone (cheap)
+                                w.tier.clone(),         // Arc clone (cheap)
                                 w.dimensions,
-                                w.db_path.clone(),        // Arc clone (cheap)
+                                w.db_path.clone(), // Arc clone (cheap)
                             )
                         } else {
                             continue;
                         }
                     };
-                    
+
                     let total = changed.len() + deleted.len();
                     if total == 0 {
                         continue;
                     }
-                    
+
                     // Update last watched timestamp
                     if let Err(e) = storage
                         .set_last_watched_timestamp(&chrono::Utc::now().to_rfc3339())
                         .await
                     {
-                        tracing::warn!("failed to update last_watched_timestamp for {}: {}", key, e);
+                        tracing::warn!(
+                            "failed to update last_watched_timestamp for {}: {}",
+                            key,
+                            e
+                        );
                     }
-                    
-                    tracing::debug!("processing {} changes, {} deletions for {}", changed.len(), deleted.len(), key);
-                    
+
+                    tracing::debug!(
+                        "processing {} changes, {} deletions for {}",
+                        changed.len(),
+                        deleted.len(),
+                        key
+                    );
+
                     // Invalidate discovery cache so file counts stay fresh
                     // (used by adaptive semaphore weight for linked project indexing)
                     if let Ok(root_path) = PathBuf::from(root.as_ref()).canonicalize() {
@@ -4368,8 +4854,9 @@ pub async fn run(port: u16) -> Result<()> {
                     }
 
                     // Check if any changed/deleted files should invalidate the links cache
-                    let should_invalidate = changed.iter().any(|p| should_invalidate_links_cache(p))
-                        || deleted.iter().any(|p| should_invalidate_links_cache(p));
+                    let should_invalidate =
+                        changed.iter().any(|p| should_invalidate_links_cache(p))
+                            || deleted.iter().any(|p| should_invalidate_links_cache(p));
                     if should_invalidate {
                         if let Ok(root_path) = PathBuf::from(root.as_ref()).canonicalize() {
                             let root_path_owned = root_path.clone();
@@ -4378,17 +4865,20 @@ pub async fn run(port: u16) -> Result<()> {
                             });
                         }
                     }
-                    
+
                     // Process deletions through write queue
                     if !deleted.is_empty() {
-                        let paths_to_delete: Vec<String> = deleted.iter()
-                            .map(|path| crate::discover::relative_path(path, &*root, &*include_dirs))
+                        let paths_to_delete: Vec<String> = deleted
+                            .iter()
+                            .map(|path| {
+                                crate::discover::relative_path(path, &*root, &*include_dirs)
+                            })
                             .collect();
                         if let Err(e) = write_queue.delete(paths_to_delete).await {
                             tracing::warn!("failed to queue deletions: {}", e);
                         }
                     }
-                    
+
                     // Process changes in parallel with concurrency limit
                     if !changed.is_empty() {
                         let ops = changed.len() as u64;
@@ -4397,79 +4887,102 @@ pub async fn run(port: u16) -> Result<()> {
                         // Shared embed semaphore matching embedder worker capacity
                         let embed = Arc::new(tokio::sync::Semaphore::new(4));
 
-                        let mut futs: futures::stream::FuturesUnordered<_> = changed.into_iter().map(|path| {
-                            let sema = sema.clone();
-                            let embed = embed.clone();
-                            let storage = storage.clone();
-                            let write_queue = write_queue.clone();
-                            let root = root.clone();
-                            let include_dirs = include_dirs.clone();
-                            let symlink_dirs = symlink_dirs.clone();
-                            let tier = tier.clone();
-                            let db_path = db_path.clone();
+                        let mut futs: futures::stream::FuturesUnordered<_> = changed
+                            .into_iter()
+                            .map(|path| {
+                                let sema = sema.clone();
+                                let embed = embed.clone();
+                                let storage = storage.clone();
+                                let write_queue = write_queue.clone();
+                                let root = root.clone();
+                                let include_dirs = include_dirs.clone();
+                                let symlink_dirs = symlink_dirs.clone();
+                                let tier = tier.clone();
+                                let db_path = db_path.clone();
 
-                            async move {
-                                let _permit = sema.acquire().await.ok()?;
+                                async move {
+                                    let _permit = sema.acquire().await.ok()?;
 
-                                let rel = match tokio::fs::canonicalize(&path).await {
-                                    Ok(p) => p,
-                                    Err(_) => return None,
-                                };
-                                let rel_path = crate::discover::relative_path(&rel, &*root, &*include_dirs);
+                                    let rel = match tokio::fs::canonicalize(&path).await {
+                                        Ok(p) => p,
+                                        Err(_) => return None,
+                                    };
+                                    let rel_path = crate::discover::relative_path(
+                                        &rel,
+                                        &*root,
+                                        &*include_dirs,
+                                    );
 
-                                // Fast-path: skip unchanged files
-                                if let Ok(content) = tokio::fs::read_to_string(&rel).await {
-                                    let hash = tokio::task::spawn_blocking({
-                                        let content = content.clone();
-                                        move || crate::storage::hash_content(&content)
-                                    }).await.unwrap_or_default();
-                                    if !storage.needs_index(&rel_path, &hash).await.unwrap_or(true) {
-                                        return None;
+                                    // Fast-path: skip unchanged files
+                                    if let Ok(content) = tokio::fs::read_to_string(&rel).await {
+                                        let hash = tokio::task::spawn_blocking({
+                                            let content = content.clone();
+                                            move || crate::storage::hash_content(&content)
+                                        })
+                                        .await
+                                        .unwrap_or_default();
+                                        if !storage
+                                            .needs_index(&rel_path, &hash)
+                                            .await
+                                            .unwrap_or(true)
+                                        {
+                                            return None;
+                                        }
+                                    }
+
+                                    // Index the file
+                                    let mut client = crate::model_client::pooled().await.ok()?;
+
+                                    match crate::cli::update_file_partial_pub(
+                                        &*root,
+                                        &*include_dirs,
+                                        &*symlink_dirs,
+                                        &*db_path,
+                                        &storage,
+                                        &mut client,
+                                        &rel,
+                                        &tier,
+                                        dims,
+                                        "int8",
+                                        None,
+                                        &*embed,
+                                        false,
+                                        false,
+                                        &*write_queue,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(update)) => {
+                                            tracing::debug!(
+                                                "indexed {}: {} chunks",
+                                                rel_path,
+                                                update.chunks
+                                            );
+                                            Some(1u64)
+                                        }
+                                        Ok(None) => None,
+                                        Err(e) => {
+                                            tracing::warn!("failed to index {}: {}", rel_path, e);
+                                            None
+                                        }
                                     }
                                 }
-
-                                // Index the file
-                                let mut client = crate::model_client::pooled().await.ok()?;
-
-                                match crate::cli::update_file_partial_pub(
-                                    &*root,
-                                    &*include_dirs,
-                                    &*symlink_dirs,
-                                    &*db_path,
-                                    &storage,
-                                    &mut client,
-                                    &rel,
-                                    &tier,
-                                    dims,
-                                    "int8",
-                                    None,
-                                    &*embed,
-                                    false,
-                                    false,
-                                    &*write_queue,
-                                ).await {
-                                    Ok(Some(update)) => {
-                                        tracing::debug!("indexed {}: {} chunks", rel_path, update.chunks);
-                                        Some(1u64)
-                                    }
-                                    Ok(None) => None,
-                                    Err(e) => {
-                                        tracing::warn!("failed to index {}: {}", rel_path, e);
-                                        None
-                                    }
-                                }
-                            }
-                        }).collect();
+                            })
+                            .collect();
 
                         use futures::StreamExt as _;
                         while let Some(_) = futs.next().await {}
-                        
+
                         // Update last_update_timestamp after successful processing
                         let now = chrono::Utc::now().to_rfc3339();
                         if let Err(e) = storage.set_last_update_timestamp(&now).await {
-                            tracing::warn!("failed to update last_update_timestamp for {}: {}", key, e);
+                            tracing::warn!(
+                                "failed to update last_update_timestamp for {}: {}",
+                                key,
+                                e
+                            );
                         }
-                        
+
                         // Update ops counter and queue compaction if threshold reached
                         {
                             let mut s = state.lock().await;
@@ -4478,14 +4991,19 @@ pub async fn run(port: u16) -> Result<()> {
                                 if w.ops_since_compact >= 100 {
                                     // Reset counter and queue compaction (non-blocking)
                                     w.ops_since_compact = 0;
-                                    queue_compaction(&compaction_tx, (*db_path).clone(), dims, "watcher");
+                                    queue_compaction(
+                                        &compaction_tx,
+                                        (*db_path).clone(),
+                                        dims,
+                                        "watcher",
+                                    );
                                 }
                             }
                         }
                     }
                 }
             }
-            
+
             tracing::info!("watcher processor shutting down");
         });
     }
@@ -4496,32 +5014,33 @@ pub async fn run(port: u16) -> Result<()> {
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let min_batch_interval = Duration::from_millis(500);
-            
+
             loop {
                 // Wait for any memory watcher to have pending changes
                 let had_pending = tokio::time::timeout(
                     Duration::from_secs(300),
-                    wait_for_any_memory_pending(&state)
-                ).await.is_ok();
-                
+                    wait_for_any_memory_pending(&state),
+                )
+                .await
+                .is_ok();
+
                 // Check shutdown
                 if *shutdown_rx.borrow() {
                     tracing::info!("memory watcher processor received shutdown");
                     break;
                 }
-                
+
                 if !had_pending {
                     continue;
                 }
-                
+
                 // Add batching delay to coalesce rapid changes
                 tokio::time::sleep(min_batch_interval).await;
-                
+
                 // Get all memory watcher scopes
-                let scopes: Vec<String> = {
-                    state.lock().await.memory_watchers.keys().cloned().collect()
-                };
-                
+                let scopes: Vec<String> =
+                    { state.lock().await.memory_watchers.keys().cloned().collect() };
+
                 for scope in scopes {
                     // Drain pending paths
                     let (changed, deleted, storage, write_queue, root, db_path, failed_files) = {
@@ -4532,54 +5051,69 @@ pub async fn run(port: u16) -> Result<()> {
                                 continue;
                             }
                             let Some(wq) = w.write_queue.as_ref() else {
-                                tracing::warn!("write_queue drained for memory watcher {}, skipping", scope);
+                                tracing::warn!(
+                                    "write_queue drained for memory watcher {}, skipping",
+                                    scope
+                                );
                                 continue;
                             };
                             let (changed, deleted) = pending.drain();
-                            (changed, deleted, w.storage.clone(), wq.clone(), w.root.clone(), w.db_path.clone(), w.failed_files.clone())
+                            (
+                                changed,
+                                deleted,
+                                w.storage.clone(),
+                                wq.clone(),
+                                w.root.clone(),
+                                w.db_path.clone(),
+                                w.failed_files.clone(),
+                            )
                         } else {
                             continue;
                         }
                     };
-                    
+
                     let total = changed.len() + deleted.len();
                     if total == 0 {
                         continue;
                     }
-                    
+
                     tracing::debug!("processing {} memory changes for scope: {}", total, scope);
-                    
+
                     // Process deletions
                     for file_path in deleted {
-                        let rel_path = file_path.strip_prefix(&*root)
+                        let rel_path = file_path
+                            .strip_prefix(&*root)
                             .unwrap_or(&file_path)
                             .to_string_lossy()
                             .to_string();
-                        
+
                         write_queue.delete_file(&rel_path).await;
                         // Remove from failed files if it was there
                         failed_files.lock().await.remove(&file_path);
                         tracing::debug!("deleted memory file from index: {}", rel_path);
                     }
-                    
+
                     // Process changed files - actually index them
                     let embed = tokio::sync::Semaphore::new(4);
                     for file_path in changed {
                         // Skip temporary files
-                        let filename = file_path.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("");
+                        let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         if filename.starts_with('.') || filename.contains(".tmp.") {
                             continue;
                         }
-                        
-                        let rel_path = file_path.strip_prefix(&*root)
+
+                        let rel_path = file_path
+                            .strip_prefix(&*root)
                             .unwrap_or(&file_path)
                             .to_string_lossy()
                             .to_string();
-                        
-                        tracing::debug!("indexing changed memory file: {} (scope: {})", rel_path, scope);
-                        
+
+                        tracing::debug!(
+                            "indexing changed memory file: {} (scope: {})",
+                            rel_path,
+                            scope
+                        );
+
                         // Read file content
                         let content = match tokio::fs::read_to_string(&file_path).await {
                             Ok(c) => c,
@@ -4592,24 +5126,33 @@ pub async fn run(port: u16) -> Result<()> {
                                 continue;
                             }
                         };
-                        
+
                         // Check if file needs indexing (hash comparison)
                         let file_hash = tokio::task::spawn_blocking({
                             let content = content.clone();
                             move || crate::storage::hash_content(&content)
-                        }).await.unwrap_or_default();
-                        if !storage.needs_index(&rel_path, &file_hash).await.unwrap_or(true) {
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if !storage
+                            .needs_index(&rel_path, &file_hash)
+                            .await
+                            .unwrap_or(true)
+                        {
                             tracing::debug!("memory file unchanged, skipping: {}", rel_path);
                             // Clear from failed files on success
                             failed_files.lock().await.remove(&file_path);
                             continue;
                         }
-                        
+
                         // Get model client and index the file
                         let mut client = match crate::model_client::pooled().await {
                             Ok(c) => c,
                             Err(e) => {
-                                tracing::warn!("failed to get model client for memory indexing: {}", e);
+                                tracing::warn!(
+                                    "failed to get model client for memory indexing: {}",
+                                    e
+                                );
                                 // Track failure for retry
                                 let mut ff = failed_files.lock().await;
                                 let count = ff.entry(file_path.clone()).or_insert(0);
@@ -4617,32 +5160,36 @@ pub async fn run(port: u16) -> Result<()> {
                                 continue;
                             }
                         };
-                        
+
                         let tier = "budget";
                         let dims = 1024u32;
-                        
+
                         // Use partial update to index the file
                         match crate::cli::update_file_partial_pub(
                             &root,
-                            &[],             // include_dirs
-                            &[],             // symlink_dirs
+                            &[], // include_dirs
+                            &[], // symlink_dirs
                             &db_path,
                             &*storage,
                             &mut client,
                             &file_path,
                             tier,
                             dims,
-                            "int8",          // quantization
-                            None,            // daily_cost_limit
+                            "int8", // quantization
+                            None,   // daily_cost_limit
                             &embed,
-                            false,           // force
-                            false,           // verbose
+                            false, // force
+                            false, // verbose
                             &write_queue,
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(Some(update)) => {
                                 tracing::info!(
                                     "indexed memory file: {} (chunks: {}, embedded: {})",
-                                    rel_path, update.chunks, update.embedded
+                                    rel_path,
+                                    update.chunks,
+                                    update.embedded
                                 );
                                 // Clear from failed files on success
                                 failed_files.lock().await.remove(&file_path);
@@ -4659,7 +5206,10 @@ pub async fn run(port: u16) -> Result<()> {
                                 let count = ff.entry(file_path.clone()).or_insert(0);
                                 *count += 1;
                                 if *count >= 3 {
-                                    tracing::error!("memory file indexing failed after 3 attempts: {}", rel_path);
+                                    tracing::error!(
+                                        "memory file indexing failed after 3 attempts: {}",
+                                        rel_path
+                                    );
                                     drop(ff);
                                     failed_files.lock().await.remove(&file_path);
                                 }
@@ -4668,20 +5218,20 @@ pub async fn run(port: u16) -> Result<()> {
                     }
                 }
             }
-            
+
             tracing::info!("memory watcher processor shutting down");
         });
     }
-    
+
     // Memory indexing retry task - periodically retries failed memory file indexing
     {
         let state = state.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let retry_interval = Duration::from_secs(30);
-            
+
             let mut shutdown_rx = shutdown_rx.clone();
-            
+
             loop {
                 // Wait for retry interval or shutdown
                 tokio::select! {
@@ -4693,24 +5243,39 @@ pub async fn run(port: u16) -> Result<()> {
                         }
                     }
                 }
-                
+
                 // Check shutdown again
                 if *shutdown_rx.borrow() {
                     break;
                 }
-                
+
                 // Get all memory watcher scopes and their failed files
-                let watchers_data: Vec<(String, Arc<PathBuf>, Arc<PathBuf>, Arc<crate::storage::Storage>, Arc<crate::storage::WriteQueue>, Arc<tokio::sync::Mutex<HashMap<PathBuf, u32>>>)> = {
+                let watchers_data: Vec<(
+                    String,
+                    Arc<PathBuf>,
+                    Arc<PathBuf>,
+                    Arc<crate::storage::Storage>,
+                    Arc<crate::storage::WriteQueue>,
+                    Arc<tokio::sync::Mutex<HashMap<PathBuf, u32>>>,
+                )> = {
                     let s = state.lock().await;
-                    s.memory_watchers.iter()
+                    s.memory_watchers
+                        .iter()
                         .filter_map(|(scope, w)| {
                             w.write_queue.as_ref().map(|wq| {
-                                (scope.clone(), w.root.clone(), w.db_path.clone(), w.storage.clone(), wq.clone(), w.failed_files.clone())
+                                (
+                                    scope.clone(),
+                                    w.root.clone(),
+                                    w.db_path.clone(),
+                                    w.storage.clone(),
+                                    wq.clone(),
+                                    w.failed_files.clone(),
+                                )
                             })
                         })
                         .collect()
                 };
-                
+
                 for (scope, root, db_path, storage, write_queue, failed_files) in watchers_data {
                     // Get files to retry (failure count < 3)
                     let files_to_retry: Vec<PathBuf> = {
@@ -4720,13 +5285,17 @@ pub async fn run(port: u16) -> Result<()> {
                             .map(|(path, _)| path.clone())
                             .collect()
                     };
-                    
+
                     if files_to_retry.is_empty() {
                         continue;
                     }
-                    
-                    tracing::debug!("retrying {} failed memory files for scope: {}", files_to_retry.len(), scope);
-                    
+
+                    tracing::debug!(
+                        "retrying {} failed memory files for scope: {}",
+                        files_to_retry.len(),
+                        scope
+                    );
+
                     let embed = tokio::sync::Semaphore::new(4);
                     for file_path in files_to_retry {
                         // Check if file still exists
@@ -4735,19 +5304,24 @@ pub async fn run(port: u16) -> Result<()> {
                             failed_files.lock().await.remove(&file_path);
                             continue;
                         }
-                        
-                        let rel_path = file_path.strip_prefix(&*root)
+
+                        let rel_path = file_path
+                            .strip_prefix(&*root)
                             .unwrap_or(&file_path)
                             .to_string_lossy()
                             .to_string();
-                        
+
                         tracing::debug!("retrying memory file indexing: {}", rel_path);
-                        
+
                         // Read file content
                         let content = match tokio::fs::read_to_string(&file_path).await {
                             Ok(c) => c,
                             Err(e) => {
-                                tracing::debug!("failed to read memory file for retry {}: {}", rel_path, e);
+                                tracing::debug!(
+                                    "failed to read memory file for retry {}: {}",
+                                    rel_path,
+                                    e
+                                );
                                 let mut ff = failed_files.lock().await;
                                 if let Some(count) = ff.get_mut(&file_path) {
                                     *count += 1;
@@ -4755,18 +5329,24 @@ pub async fn run(port: u16) -> Result<()> {
                                 continue;
                             }
                         };
-                        
+
                         // Check if file needs indexing
                         let file_hash = tokio::task::spawn_blocking({
                             let content = content.clone();
                             move || crate::storage::hash_content(&content)
-                        }).await.unwrap_or_default();
-                        if !storage.needs_index(&rel_path, &file_hash).await.unwrap_or(true) {
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if !storage
+                            .needs_index(&rel_path, &file_hash)
+                            .await
+                            .unwrap_or(true)
+                        {
                             // Already indexed, remove from failed files
                             failed_files.lock().await.remove(&file_path);
                             continue;
                         }
-                        
+
                         // Get model client
                         let mut client = match crate::model_client::pooled().await {
                             Ok(c) => c,
@@ -4779,10 +5359,10 @@ pub async fn run(port: u16) -> Result<()> {
                                 continue;
                             }
                         };
-                        
+
                         let tier = "budget";
                         let dims = 1024u32;
-                        
+
                         // Index the file
                         match crate::cli::update_file_partial_pub(
                             &root,
@@ -4800,7 +5380,9 @@ pub async fn run(port: u16) -> Result<()> {
                             false,
                             false,
                             &write_queue,
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(Some(update)) => {
                                 tracing::info!(
                                     "retry succeeded for memory file: {} (chunks: {}, embedded: {})",
@@ -4809,7 +5391,10 @@ pub async fn run(port: u16) -> Result<()> {
                                 failed_files.lock().await.remove(&file_path);
                             }
                             Ok(None) => {
-                                tracing::debug!("retry: memory file skipped (no changes): {}", rel_path);
+                                tracing::debug!(
+                                    "retry: memory file skipped (no changes): {}",
+                                    rel_path
+                                );
                                 failed_files.lock().await.remove(&file_path);
                             }
                             Err(e) => {
@@ -4826,7 +5411,7 @@ pub async fn run(port: u16) -> Result<()> {
                     }
                 }
             }
-            
+
             tracing::info!("memory indexing retry task shutting down");
         });
     }
@@ -4858,10 +5443,11 @@ pub async fn run(port: u16) -> Result<()> {
                 // Collect databases that need compaction and prune stale entries
                 let to_compact: Vec<(PathBuf, u32)> = {
                     let mut s = state.lock().await;
-                    
+
                     // Remove compaction state entries that haven't been active in 24 hours
                     let now = Instant::now();
-                    let stale_keys: Vec<String> = s.compaction
+                    let stale_keys: Vec<String> = s
+                        .compaction
                         .iter()
                         .filter(|(_, cs)| {
                             now.duration_since(cs.last_activity) >= COMPACTION_STATE_TTL
@@ -4870,7 +5456,7 @@ pub async fn run(port: u16) -> Result<()> {
                         })
                         .map(|(k, _)| k.clone())
                         .collect();
-                    
+
                     for key in &stale_keys {
                         if let Some(cs) = s.compaction.remove(key) {
                             tracing::debug!(
@@ -4880,11 +5466,13 @@ pub async fn run(port: u16) -> Result<()> {
                             );
                         }
                     }
-                    
+
                     // Collect databases that need compaction (skip already in-progress)
                     s.compaction
                         .iter()
-                        .filter(|(_, cs)| cs.should_compact(idle_threshold, ops_threshold, force_threshold))
+                        .filter(|(_, cs)| {
+                            cs.should_compact(idle_threshold, ops_threshold, force_threshold)
+                        })
                         .map(|(_, cs)| (cs.db_path.clone(), cs.dimensions))
                         .collect()
                 };
@@ -4898,8 +5486,10 @@ pub async fn run(port: u16) -> Result<()> {
     }
 
     // Set up signal handlers for graceful cleanup on SIGTERM/SIGINT/SIGHUP
-    let mut sigterm = signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
-    let mut sigint = signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?;
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+    let mut sigint =
+        signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?;
     let mut sighup = signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?;
 
     // Start HTTP server
@@ -4943,14 +5533,14 @@ pub async fn run(port: u16) -> Result<()> {
 // Helper function to wait for any watcher to have pending changes
 async fn wait_for_any_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
     use futures::stream::{FuturesUnordered, StreamExt};
-    
+
     // Get notify handles and check if any have pending changes
     // IMPORTANT: We clone the Arc<Notify> so we can wait WITHOUT holding the mutex
     let (notify_handles, has_pending): (Vec<Arc<tokio::sync::Notify>>, bool) = {
         let s = state.lock().await;
         let mut has_pending = false;
         let mut handles = Vec::new();
-        
+
         for w in s.watchers.values() {
             // Try to check pending without blocking
             if let Ok(pending) = w.pending.try_lock() {
@@ -4964,18 +5554,18 @@ async fn wait_for_any_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
         (handles, has_pending)
     };
     // Lock is released here
-    
+
     // If there are already pending changes, return immediately
     if has_pending {
         return;
     }
-    
+
     if notify_handles.is_empty() {
         // No watchers registered — sleep for the full outer timeout duration
         tokio::time::sleep(Duration::from_secs(300)).await;
         return;
     }
-    
+
     // Wait for any notification WITHOUT holding any locks
     // Each notify handle is an Arc<Notify>, so we can wait on it directly
     let mut futures = FuturesUnordered::new();
@@ -4984,7 +5574,7 @@ async fn wait_for_any_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
             notify.notified().await;
         });
     }
-    
+
     // Wait for the first notification to complete
     match futures.next().await {
         Some(_) => {
@@ -4999,13 +5589,13 @@ async fn wait_for_any_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
 /// Wait for any memory watcher to have pending changes (async, non-blocking)
 async fn wait_for_any_memory_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
     use futures::stream::{FuturesUnordered, StreamExt};
-    
+
     // Get notify handles and check if any have pending changes
     let (notify_handles, has_pending): (Vec<Arc<tokio::sync::Notify>>, bool) = {
         let s = state.lock().await;
         let mut has_pending = false;
         let mut handles = Vec::new();
-        
+
         for w in s.memory_watchers.values() {
             if let Ok(pending) = w.pending.try_lock() {
                 if !pending.is_empty() {
@@ -5016,18 +5606,18 @@ async fn wait_for_any_memory_pending(state: &Arc<tokio::sync::Mutex<DaemonState>
         }
         (handles, has_pending)
     };
-    
+
     // If there are already pending changes, return immediately
     if has_pending {
         return;
     }
-    
+
     if notify_handles.is_empty() {
         // No watchers registered — sleep for the full outer timeout duration
         tokio::time::sleep(Duration::from_secs(300)).await;
         return;
     }
-    
+
     // Wait for any notification
     let mut futures = FuturesUnordered::new();
     for notify in notify_handles {
@@ -5035,7 +5625,7 @@ async fn wait_for_any_memory_pending(state: &Arc<tokio::sync::Mutex<DaemonState>
             notify.notified().await;
         });
     }
-    
+
     match futures.next().await {
         Some(_) => {}
         None => {
@@ -5139,8 +5729,8 @@ mod compaction_tests {
 
         let result = state.should_compact(
             Duration::from_secs(30), // idle_threshold
-            50,                       // ops_threshold
-            200,                      // force_threshold
+            50,                      // ops_threshold
+            200,                     // force_threshold
         );
 
         assert!(!result, "should not compact when no operations");
@@ -5156,11 +5746,7 @@ mod compaction_tests {
         }
         state.mark_compaction_started();
 
-        let result = state.should_compact(
-            Duration::from_secs(30),
-            50,
-            200,
-        );
+        let result = state.should_compact(Duration::from_secs(30), 50, 200);
 
         assert!(!result, "should not compact when already in progress");
     }
@@ -5176,8 +5762,8 @@ mod compaction_tests {
 
         let result = state.should_compact(
             Duration::from_secs(30), // idle_threshold - doesn't matter for force
-            50,                       // ops_threshold
-            200,                      // force_threshold
+            50,                      // ops_threshold
+            200,                     // force_threshold
         );
 
         assert!(result, "should compact when force threshold reached");
@@ -5197,8 +5783,8 @@ mod compaction_tests {
 
         let result = state.should_compact(
             Duration::from_secs(30), // idle_threshold
-            50,                       // ops_threshold
-            200,                      // force_threshold
+            50,                      // ops_threshold
+            200,                     // force_threshold
         );
 
         assert!(result, "should compact when idle and ops above threshold");
@@ -5216,8 +5802,8 @@ mod compaction_tests {
         // last_operation_time is now, so not idle
         let result = state.should_compact(
             Duration::from_secs(30), // idle_threshold
-            50,                       // ops_threshold
-            200,                      // force_threshold
+            50,                      // ops_threshold
+            200,                     // force_threshold
         );
 
         assert!(!result, "should not compact when not idle enough");
@@ -5237,8 +5823,8 @@ mod compaction_tests {
 
         let result = state.should_compact(
             Duration::from_secs(30), // idle_threshold
-            50,                       // ops_threshold
-            200,                      // force_threshold
+            50,                      // ops_threshold
+            200,                     // force_threshold
         );
 
         assert!(!result, "should not compact when ops below threshold");
@@ -5332,68 +5918,73 @@ mod compaction_tests {
     #[test]
     fn test_link_cache_lock_contention_handled() {
         use std::thread;
-        
+
         // cached_discover_links uses try_read/try_write to avoid blocking
         // Test that multiple threads can call it without panicking on lock contention
-        let handles: Vec<_> = (0..5).map(|_| {
-            thread::spawn(|| {
-                // Create a temporary directory for testing
-                let temp = tempfile::TempDir::new().unwrap();
-                let root = temp.path().to_str().unwrap();
-                
-                // Call the function that uses try_read/try_write
-                let links = cached_discover_links(root);
-                
-                // Function should not panic, even if lock is contended
-                // (it will either use cache or compute fresh)
-                drop(links);
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                thread::spawn(|| {
+                    // Create a temporary directory for testing
+                    let temp = tempfile::TempDir::new().unwrap();
+                    let root = temp.path().to_str().unwrap();
+
+                    // Call the function that uses try_read/try_write
+                    let links = cached_discover_links(root);
+
+                    // Function should not panic, even if lock is contended
+                    // (it will either use cache or compute fresh)
+                    drop(links);
+                })
             })
-        }).collect();
-        
+            .collect();
+
         // Wait for all threads
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // If we got here, no panics occurred
     }
-    
+
     #[test]
     fn test_link_cache_stores_and_retrieves() {
         // Test that the link cache actually caches results
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().to_str().unwrap();
-        
+
         // First call - should compute and cache
         let links1 = cached_discover_links(root);
-        
+
         // Second call immediately after - should use cache
         let links2 = cached_discover_links(root);
-        
+
         // Results should be consistent (both from cache or both fresh)
         assert_eq!(links1.len(), links2.len());
     }
-    
+
     #[test]
     fn test_link_cache_ttl_expiry() {
         // Test that the cache respects TTL (though we can't easily test the timeout itself)
         // We just verify the cache structure works
         use std::time::Instant;
-        
+
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().to_str().unwrap();
-        
+
         // Get links (will cache)
         let _links = cached_discover_links(root);
-        
+
         // Verify cache was populated (by calling again and seeing it's fast)
         let start = Instant::now();
         let _links2 = cached_discover_links(root);
         let elapsed = start.elapsed();
-        
+
         // Cache hit should be very fast (< 10ms)
-        assert!(elapsed < std::time::Duration::from_millis(10),
-                "cache lookup should be fast, took {:?}", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "cache lookup should be fast, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -5506,11 +6097,11 @@ mod pending_changes_tests {
         let mut pc = PendingChanges::new();
         pc.add_deleted(vec![PathBuf::from("a.txt")]);
         assert_eq!(pc.len(), 1);
-        
+
         // Adding as changed should move it from deleted to changed
         pc.add_changed(vec![PathBuf::from("a.txt")]);
         assert_eq!(pc.len(), 1); // Still 1, not 2
-        
+
         let (changed, deleted) = pc.drain();
         assert_eq!(changed.len(), 1);
         assert_eq!(deleted.len(), 0);
@@ -5522,11 +6113,11 @@ mod pending_changes_tests {
         let mut pc = PendingChanges::new();
         pc.add_changed(vec![PathBuf::from("a.txt")]);
         assert_eq!(pc.len(), 1);
-        
+
         // Adding as deleted should move it from changed to deleted
         pc.add_deleted(vec![PathBuf::from("a.txt")]);
         assert_eq!(pc.len(), 1); // Still 1, not 2
-        
+
         let (changed, deleted) = pc.drain();
         assert_eq!(changed.len(), 0);
         assert_eq!(deleted.len(), 1);
@@ -5539,11 +6130,11 @@ mod pending_changes_tests {
         pc.add_changed(vec![PathBuf::from("a.txt")]);
         pc.add_deleted(vec![PathBuf::from("b.txt")]);
         assert_eq!(pc.len(), 2);
-        
+
         let (changed, deleted) = pc.drain();
         assert_eq!(changed.len(), 1);
         assert_eq!(deleted.len(), 1);
-        
+
         // After drain, should be empty
         assert!(pc.is_empty());
         assert_eq!(pc.len(), 0);
@@ -5554,7 +6145,7 @@ mod pending_changes_tests {
         let mut pc = PendingChanges::new();
         pc.add_changed(vec![PathBuf::from("a.txt"), PathBuf::from("a.txt")]);
         assert_eq!(pc.len(), 1); // Deduplicated
-        
+
         pc.add_changed(vec![PathBuf::from("a.txt")]);
         assert_eq!(pc.len(), 1); // Still 1
     }
@@ -5562,15 +6153,15 @@ mod pending_changes_tests {
     #[test]
     fn pending_changes_handles_mixed_operations() {
         let mut pc = PendingChanges::new();
-        
+
         // Simulate: file created, modified, then different file deleted
         pc.add_changed(vec![PathBuf::from("new.txt")]);
         pc.add_changed(vec![PathBuf::from("new.txt")]); // Modified again
         pc.add_deleted(vec![PathBuf::from("old.txt")]);
         pc.add_changed(vec![PathBuf::from("another.txt")]);
-        
+
         assert_eq!(pc.len(), 3);
-        
+
         let (changed, deleted) = pc.drain();
         assert_eq!(changed.len(), 2); // new.txt, another.txt
         assert_eq!(deleted.len(), 1); // old.txt
@@ -5617,15 +6208,15 @@ mod dropped_event_stats_tests {
     #[test]
     fn dropped_event_stats_accumulates_over_time() {
         let mut stats = DroppedEventStats::default();
-        
+
         // First backpressure event
         stats.changed_files_dropped += 10;
         stats.backpressure_events += 1;
-        
+
         // Second backpressure event
         stats.changed_files_dropped += 5;
         stats.backpressure_events += 1;
-        
+
         // Third event with deleted files
         stats.deleted_files_dropped += 3;
         stats.backpressure_events += 1;
@@ -5639,18 +6230,20 @@ mod dropped_event_stats_tests {
     fn dropped_event_stats_log_rate_limiting() {
         let mut stats = DroppedEventStats::default();
         let now = Instant::now();
-        
+
         // First log should always happen (no last_log_time)
-        let should_log_first = stats.last_log_time
+        let should_log_first = stats
+            .last_log_time
             .map(|t| now.duration_since(t) >= Duration::from_secs(30))
             .unwrap_or(true);
         assert!(should_log_first);
-        
+
         // Set last_log_time to now
         stats.last_log_time = Some(now);
-        
+
         // Immediate second log should be suppressed
-        let should_log_immediate = stats.last_log_time
+        let should_log_immediate = stats
+            .last_log_time
             .map(|t| Instant::now().duration_since(t) >= Duration::from_secs(30))
             .unwrap_or(true);
         assert!(!should_log_immediate);
@@ -5691,7 +6284,10 @@ mod http_dispatch_tests {
     #[tokio::test]
     async fn unknown_method_returns_error() {
         let result = handle_request("no_such_method", &serde_json::Value::Null).await;
-        assert!(result["error"].is_string(), "expected error key, got: {result}");
+        assert!(
+            result["error"].is_string(),
+            "expected error key, got: {result}"
+        );
         assert!(
             result["error"].as_str().unwrap().contains("unknown method"),
             "unexpected error: {}",
@@ -5724,17 +6320,20 @@ mod http_dispatch_tests {
     async fn dispatcher_handles_unknown_method() {
         let d = make_dispatcher(make_state());
         let result = d("no_such_method".to_string(), serde_json::Value::Null).await;
-        assert!(result["error"].is_string(), "expected error key, got: {result}");
+        assert!(
+            result["error"].is_string(),
+            "expected error key, got: {result}"
+        );
     }
 }
 
 #[cfg(test)]
 mod concurrency_tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
     use futures::stream::FuturesUnordered;
     use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     /// Verify watcher concurrency is bounded to min(4, cpus/2).max(1)
     #[test]
@@ -5783,8 +6382,14 @@ mod concurrency_tests {
         while let Some(_) = futs.next().await {}
 
         let max = peak.load(Ordering::SeqCst);
-        assert!(max <= 4, "peak concurrency {max} should be <= 4 (embed semaphore)");
-        assert!(max >= 2, "peak concurrency {max} should be >= 2 to confirm parallelism");
+        assert!(
+            max <= 4,
+            "peak concurrency {max} should be <= 4 (embed semaphore)"
+        );
+        assert!(
+            max >= 2,
+            "peak concurrency {max} should be >= 2 to confirm parallelism"
+        );
     }
 
     /// Verify FuturesUnordered processes all items (no lost futures)
@@ -5793,18 +6398,23 @@ mod concurrency_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let total = 50;
 
-        let mut futs: FuturesUnordered<_> = (0..total).map(|_| {
-            let count = count.clone();
-            async move {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                count.fetch_add(1, Ordering::SeqCst);
-            }
-        }).collect();
+        let mut futs: FuturesUnordered<_> = (0..total)
+            .map(|_| {
+                let count = count.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .collect();
 
         while let Some(_) = futs.next().await {}
 
-        assert_eq!(count.load(Ordering::SeqCst), total,
-            "all {total} futures must complete");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            total,
+            "all {total} futures must complete"
+        );
     }
 
     /// Verify FuturesUnordered streams results incrementally (not all-at-once like join_all)
@@ -5813,13 +6423,15 @@ mod concurrency_tests {
         let completed = Arc::new(AtomicUsize::new(0));
         let total = 20;
 
-        let mut futs: FuturesUnordered<_> = (0..total).map(|i| {
-            async move {
-                // Stagger completions: task 0 finishes first, task 19 finishes last
-                tokio::time::sleep(Duration::from_millis(i as u64 * 5)).await;
-                i
-            }
-        }).collect();
+        let mut futs: FuturesUnordered<_> = (0..total)
+            .map(|i| {
+                async move {
+                    // Stagger completions: task 0 finishes first, task 19 finishes last
+                    tokio::time::sleep(Duration::from_millis(i as u64 * 5)).await;
+                    i
+                }
+            })
+            .collect();
 
         let mut order = Vec::with_capacity(total);
         while let Some(i) = futs.next().await {
@@ -5884,7 +6496,10 @@ mod concurrency_tests {
         let omax = outer_peak.load(Ordering::SeqCst);
         let imax = inner_peak.load(Ordering::SeqCst);
         assert!(omax <= 2, "outer peak {omax} should be <= 2");
-        assert!(imax <= 2, "inner peak {imax} should be <= outer limit (2), got {imax}");
+        assert!(
+            imax <= 2,
+            "inner peak {imax} should be <= outer limit (2), got {imax}"
+        );
     }
 }
 
@@ -5933,14 +6548,24 @@ mod startup_check_tests {
 
     #[test]
     fn retry_delay_count_is_three() {
-        assert_eq!(WATCHER_START_RETRY_DELAYS.len(), 3, "expect exactly 3 retry delays");
+        assert_eq!(
+            WATCHER_START_RETRY_DELAYS.len(),
+            3,
+            "expect exactly 3 retry delays"
+        );
     }
 
     #[test]
     fn retry_delays_are_increasing() {
         let d = WATCHER_START_RETRY_DELAYS;
         for i in 1..d.len() {
-            assert!(d[i] > d[i - 1], "delay[{i}] ({}) should exceed delay[{}] ({})", d[i], i - 1, d[i - 1]);
+            assert!(
+                d[i] > d[i - 1],
+                "delay[{i}] ({}) should exceed delay[{}] ({})",
+                d[i],
+                i - 1,
+                d[i - 1]
+            );
         }
     }
 
@@ -5950,8 +6575,7 @@ mod startup_check_tests {
     fn all_retries_attempted_on_total_failure() {
         // All attempts fail → loop exhausts all delays
         let results = [false, false, false];
-        let (started, attempts, used_delays) =
-            run_retry(&WATCHER_START_RETRY_DELAYS, &results);
+        let (started, attempts, used_delays) = run_retry(&WATCHER_START_RETRY_DELAYS, &results);
 
         assert!(!started, "should not be started after total failure");
         assert_eq!(attempts, 3, "should attempt exactly 3 times");
@@ -5963,12 +6587,14 @@ mod startup_check_tests {
     #[test]
     fn no_retry_on_first_success() {
         let results = [true, false, false];
-        let (started, attempts, used_delays) =
-            run_retry(&WATCHER_START_RETRY_DELAYS, &results);
+        let (started, attempts, used_delays) = run_retry(&WATCHER_START_RETRY_DELAYS, &results);
 
         assert!(started, "should be started on first success");
         assert_eq!(attempts, 1, "should attempt only once");
-        assert!(used_delays.is_empty(), "no delays used when first attempt succeeds");
+        assert!(
+            used_delays.is_empty(),
+            "no delays used when first attempt succeeds"
+        );
     }
 
     // -- Fix 1: success on second attempt stops further retries --
@@ -5976,8 +6602,7 @@ mod startup_check_tests {
     #[test]
     fn retry_stops_after_second_attempt_success() {
         let results = [false, true, false];
-        let (started, attempts, used_delays) =
-            run_retry(&WATCHER_START_RETRY_DELAYS, &results);
+        let (started, attempts, used_delays) = run_retry(&WATCHER_START_RETRY_DELAYS, &results);
 
         assert!(started, "should be started on second attempt");
         assert_eq!(attempts, 2, "should attempt exactly twice");
@@ -5990,12 +6615,15 @@ mod startup_check_tests {
     #[test]
     fn retry_stops_after_third_attempt_success() {
         let results = [false, false, true];
-        let (started, attempts, used_delays) =
-            run_retry(&WATCHER_START_RETRY_DELAYS, &results);
+        let (started, attempts, used_delays) = run_retry(&WATCHER_START_RETRY_DELAYS, &results);
 
         assert!(started, "should be started on third attempt");
         assert_eq!(attempts, 3, "should attempt three times");
-        assert_eq!(used_delays, vec![100u64, 200], "first two delays used before success");
+        assert_eq!(
+            used_delays,
+            vec![100u64, 200],
+            "first two delays used before success"
+        );
     }
 }
 
@@ -6011,16 +6639,20 @@ mod watcher_lifecycle_tests {
 
     #[test]
     fn tui_cleanup_settle_wait_is_100ms() {
-        assert_eq!(TUI_CLEANUP_SETTLE_MS, 100,
-            "settle wait after shutdown signal must be 100 ms");
+        assert_eq!(
+            TUI_CLEANUP_SETTLE_MS, 100,
+            "settle wait after shutdown signal must be 100 ms"
+        );
     }
 
     // -- Fix 2: drain timeout constant is 30 s --
 
     #[test]
     fn tui_cleanup_drain_timeout_is_30s() {
-        assert_eq!(TUI_CLEANUP_DRAIN_TIMEOUT_SECS, 30,
-            "drain timeout must be 30 seconds");
+        assert_eq!(
+            TUI_CLEANUP_DRAIN_TIMEOUT_SECS, 30,
+            "drain timeout must be 30 seconds"
+        );
         // Confirm Duration representation matches usage in watcher_stop / tui cleanup
         let d = Duration::from_secs(TUI_CLEANUP_DRAIN_TIMEOUT_SECS);
         assert_eq!(d, Duration::from_secs(30));
@@ -6051,15 +6683,18 @@ mod watcher_lifecycle_tests {
         seq.lock().unwrap().push("remove");
 
         let order = seq.lock().unwrap().clone();
-        assert_eq!(order, vec!["shutdown", "settle", "drain", "remove"],
-            "cleanup steps must execute in order: shutdown → settle → drain → remove");
+        assert_eq!(
+            order,
+            vec!["shutdown", "settle", "drain", "remove"],
+            "cleanup steps must execute in order: shutdown → settle → drain → remove"
+        );
     }
 
     // -- Fix 2: drain timeout respected --
 
     #[tokio::test]
     async fn drain_respects_timeout() {
-        use tokio::time::{timeout, sleep};
+        use tokio::time::{sleep, timeout};
 
         let drain_timeout = Duration::from_secs(TUI_CLEANUP_DRAIN_TIMEOUT_SECS);
         // A simulated drain that completes instantly
@@ -6070,7 +6705,7 @@ mod watcher_lifecycle_tests {
 
     #[tokio::test]
     async fn drain_timeout_triggers_on_slow_drain() {
-        use tokio::time::{timeout, sleep};
+        use tokio::time::{sleep, timeout};
 
         // Use a very short timeout to simulate expiry without waiting 30 s
         let short = Duration::from_millis(10);
@@ -6097,7 +6732,9 @@ mod watcher_lifecycle_tests {
         let order = seq.lock().unwrap().clone();
         let drain_done_pos = order.iter().position(|&s| s == "drain_done").unwrap();
         let remove_pos = order.iter().position(|&s| s == "remove").unwrap();
-        assert!(remove_pos > drain_done_pos,
-            "remove must come after drain_done; order: {order:?}");
+        assert!(
+            remove_pos > drain_done_pos,
+            "remove must come after drain_done; order: {order:?}"
+        );
     }
 }
