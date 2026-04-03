@@ -17,3 +17,4 @@ embedder/.venv/
 # OS
 .DS_Store
 Thumbs.db
+embedder/opencode_embedder/_version.py
