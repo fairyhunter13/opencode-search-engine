@@ -24,7 +24,7 @@ use arrow_array::{
         TimestampMicrosecondBuilder,
     },
     types::TimestampMicrosecondType,
-    Float32Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, RecordBatchIterator,
+    Array, Float32Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, RecordBatchIterator,
     StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -119,7 +119,8 @@ pub fn clear_corrupted_index(db_path: &Path) -> Result<bool> {
 }
 
 /// Validate that a lance table has valid data files.
-/// Returns Ok(true) if valid, Ok(false) if corrupted or missing data.
+/// Returns true if valid, false if corrupted or missing data.
+/// Checks for minimum file size (64 bytes) to detect truncated/empty .lance files.
 pub fn validate_lance_table(table_path: &Path) -> bool {
     if !table_path.is_dir() {
         return false;
@@ -129,14 +130,24 @@ pub fn validate_lance_table(table_path: &Path) -> bool {
         // Table exists but no data dir - empty table is valid
         return true;
     }
-    // Check that at least one .lance file exists if data dir exists
-    std::fs::read_dir(&data_dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .any(|e| e.path().extension().map_or(false, |ext| ext == "lance"))
-        })
-        .unwrap_or(false)
+    match std::fs::read_dir(&data_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "lance") {
+                    // Check file is not empty/truncated (min 64 bytes for header)
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.len() < 64 {
+                            return false; // Truncated file = corruption
+                        }
+                    }
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Check if the database at the given path appears corrupted.
@@ -1644,15 +1655,50 @@ impl Storage {
     /// Get the next available chunk ID with atomic increment.
     /// Holds the outer mutex briefly only to get/create the per-db entry,
     /// then increments the AtomicI64 without holding any lock.
-    async fn next_id(&self, _table: &lancedb::Table) -> Result<i64> {
+    /// On first use, seeds the counter from MAX(chunk_id) in the table to avoid
+    /// ID collisions after a daemon restart.
+    async fn next_id(&self, table: &lancedb::Table) -> Result<i64> {
         let key = self.path.to_string_lossy().to_string();
-        let counter = {
+        let needs_seed = {
+            let ids = chunk_ids().lock().unwrap();
+            !ids.contains_key(&key)
+        };
+        if needs_seed {
+            let max_id = self.get_max_chunk_id(table).await.unwrap_or(0);
             let mut ids = chunk_ids().lock().unwrap();
-            ids.entry(key)
-                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicI64::new(0)))
-                .clone()
+            ids.entry(key.clone())
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicI64::new(max_id)));
+        }
+        let counter = {
+            let ids = chunk_ids().lock().unwrap();
+            ids.get(&key).unwrap().clone()
         };
         Ok(counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+    }
+
+    /// Query MAX(chunk_id) from the table to seed the ID counter on restart.
+    async fn get_max_chunk_id(&self, table: &lancedb::Table) -> Result<i64> {
+        use futures::TryStreamExt;
+        let batches = table
+            .query()
+            .select(lancedb::query::Select::columns(&["chunk_id"]))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut max_id: i64 = 0;
+        for batch in batches {
+            if let Some(col) = batch.column_by_name("chunk_id") {
+                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            max_id = max_id.max(arr.value(i));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(max_id)
     }
 
     /// Vector search.
