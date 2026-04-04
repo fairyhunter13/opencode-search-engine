@@ -249,17 +249,30 @@ def _get_code_chunker(ts_lang: str):
 
 
 def _get_semantic_chunker():
-    """Get or create the SemanticChunker (uses local 32M model, free & fast)."""
+    """Get or create the SemanticChunker (uses local 32M model, free & fast).
+
+    GPU NOTE: model2vec's StaticModel (potion-base-32M) intentionally runs on CPU.
+    It is NOT an ONNX/transformer model — it performs static lookup + linear projection
+    via numpy, which has no GPU execution path. This is acceptable because:
+      1. Inference is sub-millisecond on CPU (no attention, no O(n²) ops)
+      2. It is only used for plain-text/prose files (rare in code repos)
+      3. The resulting text chunks are embedded by FastEmbed, which DOES use GPU
+    Attempting to pass ONNX providers would raise a TypeError.
+    """
     global _semantic_chunker
     if _semantic_chunker is None:
         from chonkie import SemanticChunker
 
+        log.debug(
+            "Loading SemanticChunker with potion-base-32M (CPU-only static model — intentional)"
+        )
         _semantic_chunker = SemanticChunker(
             embedding_model="minishlab/potion-base-32M",
             threshold=0.7,
             chunk_size=TARGET_CHARS,
             similarity_window=3,
         )
+        log.debug("SemanticChunker ready (CPU inference, static model, ~150MB)")
     return _semantic_chunker
 
 

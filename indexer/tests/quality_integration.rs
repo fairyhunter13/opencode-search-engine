@@ -588,6 +588,67 @@ export default DataTable;
 }
 
 // ---------------------------------------------------------------------------
+// Helpers: GPU enforcement
+// ---------------------------------------------------------------------------
+
+async fn assert_gpu_active(embed_port: u16) {
+    if std::env::var("OPENCODE_ONNX_PROVIDER").map(|v| v.to_lowercase()) == Ok("cpu".into()) {
+        println!("  [GPU check skipped: OPENCODE_ONNX_PROVIDER=cpu]");
+        return;
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://127.0.0.1:{embed_port}/health"))
+        .send()
+        .await
+        .expect("health request")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse health");
+
+    let gpu = &resp["result"]["gpu"];
+    let provider = gpu["provider"].as_str().unwrap_or("unknown");
+    let is_gpu = gpu["is_gpu"].as_bool().unwrap_or(false);
+    let degraded = gpu["degraded"].as_bool().unwrap_or(false);
+
+    let gpu_providers = ["tensorrt", "cuda", "migraphx", "rocm"];
+
+    assert!(
+        is_gpu,
+        "GPU enforcement failed: is_gpu=false  provider={provider}\n\
+         → GPU inference is required. Set OPENCODE_ONNX_PROVIDER=cpu to skip.\n\
+         → Full response: {gpu}"
+    );
+    assert!(
+        gpu_providers.contains(&provider),
+        "GPU enforcement failed: provider={provider:?} is not a recognised GPU provider\n\
+         → Expected one of: {gpu_providers:?}\n\
+         → Full response: {gpu}"
+    );
+    assert!(
+        !degraded,
+        "GPU degraded: provider={provider:?} fell back to CPU\n\
+         → Check ONNX Runtime GPU libraries and CUDA/ROCm driver.\n\
+         → Full response: {gpu}"
+    );
+
+    println!("  [GPU OK: provider={provider}]");
+}
+
+// ---------------------------------------------------------------------------
+// Test: GPU enforcement (fast, runs independently)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_enforcement() {
+    println!("=== GPU Enforcement Check ===");
+    let server = python_server::PythonServer::start().await.expect("start embedder");
+    assert_gpu_active(server.port).await;
+    println!("  GPU enforcement: PASSED");
+}
+
+// ---------------------------------------------------------------------------
 // Test: semantic search quality through the full pipeline
 // ---------------------------------------------------------------------------
 
@@ -596,6 +657,9 @@ async fn quality_semantic_search() {
     let (server, daemon) = setup().await.expect("setup");
     let port = daemon.port();
     let home = server.home_path().to_path_buf();
+
+    // Verify GPU is active before running the expensive quality test
+    assert_gpu_active(server.port).await;
 
     let start = Instant::now();
 
