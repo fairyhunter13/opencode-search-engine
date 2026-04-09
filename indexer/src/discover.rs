@@ -490,6 +490,18 @@ pub fn discover_files_with_config(
                         }
                     }
                 }
+
+                // Handle gitlink directories (nested git repos shown as dirs by git ls-files)
+                if !is_symlink && symlink_meta.file_type().is_dir() {
+                    let git_file = path.join(".git");
+                    if git_file.is_file() {
+                        if let Ok(abs) = path.canonicalize() {
+                            if abs != root {
+                                skipped_repos.push(abs);
+                            }
+                        }
+                    }
+                }
             }
         } else {
             use_manual_walk = true;
@@ -783,6 +795,51 @@ fn run_discover_submodules(root: &Path) -> Vec<(PathBuf, String)> {
     }
 
     results
+}
+
+/// Discover nested git repositories that aren't registered as submodules.
+/// These have `.git` files (gitlinks) instead of `.git` directories.
+pub fn discover_nested_git_repos(root: &Path) -> Vec<(PathBuf, String)> {
+    let root = match root.canonicalize() {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+    let mut repos = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_str().unwrap_or("");
+            if e.file_type().is_dir() && (name == ".git" || name == "node_modules" || name == "target" || name == "__pycache__" || name == ".lancedb") {
+                return false;
+            }
+            true
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if entry.file_name().to_str() != Some(".git") {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.depth() <= 1 {
+            continue;
+        }
+        let Some(parent) = entry.path().parent() else { continue };
+        let name = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if let Ok(abs) = parent.canonicalize() {
+            if abs != root {
+                repos.push((abs, name));
+            }
+        }
+    }
+    repos
 }
 
 #[cfg(test)]
@@ -1415,3 +1472,44 @@ mod submodule_tests {
     }
 }
 
+#[cfg(test)]
+mod nested_git_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_discover_nested_git_repos() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let nested = root.join("vendor").join("ai");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join(".git"), "gitdir: ../../.git/modules/vendor/ai").unwrap();
+        fs::write(nested.join("README.md"), "# AI").unwrap();
+
+        let nested2 = root.join("packages").join("plugin");
+        fs::create_dir_all(&nested2).unwrap();
+        fs::write(nested2.join(".git"), "gitdir: ../../.git/modules/packages/plugin").unwrap();
+
+        let normal = root.join("src");
+        fs::create_dir_all(&normal).unwrap();
+        fs::write(normal.join("main.rs"), "fn main() {}").unwrap();
+
+        fs::create_dir_all(root.join(".git")).unwrap();
+
+        let repos = discover_nested_git_repos(root);
+        assert_eq!(repos.len(), 2);
+
+        let names: Vec<&str> = repos.iter().map(|(_, n)| n.as_str()).collect();
+        assert!(names.contains(&"ai"));
+        assert!(names.contains(&"plugin"));
+    }
+
+    #[test]
+    fn test_discover_nested_git_repos_empty() {
+        let tmp = TempDir::new().unwrap();
+        let repos = discover_nested_git_repos(tmp.path());
+        assert!(repos.is_empty());
+    }
+}

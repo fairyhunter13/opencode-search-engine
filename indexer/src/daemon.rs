@@ -2841,6 +2841,30 @@ fn discover_links_impl(root: &str) -> Result<serde_json::Value> {
         }));
     }
 
+    // Also detect nested git repos that aren't registered submodules
+    // (directories with .git files instead of .git directories)
+    let nested = discover::discover_nested_git_repos(&root);
+    for (repo_path, name) in &nested {
+        if links
+            .iter()
+            .any(|l| l["path"].as_str() == Some(repo_path.to_str().unwrap_or("")))
+        {
+            continue;
+        }
+        if project.linked.get(name).map(|l| l.skip).unwrap_or(false) {
+            continue;
+        }
+        let id = storage::git_project_id(repo_path);
+        let db = storage::storage_path(repo_path);
+        links.push(serde_json::json!({
+            "path": repo_path.to_str().unwrap_or(""),
+            "projectId": id,
+            "name": name,
+            "dbPath": db.to_str().unwrap_or(""),
+            "nested_repo": true,
+        }));
+    }
+
     Ok(serde_json::json!({
         "rootProjectId": storage::git_project_id(&root),
         "links": links,
