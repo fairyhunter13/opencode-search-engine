@@ -205,13 +205,19 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Whether we've already confirmed the embedder is running this session.
 static EMBEDDER_CHECKED: AtomicBool = AtomicBool::new(false);
 
 /// PID of the embedder process we spawned (0 = not spawned by us).
 static EMBEDDER_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Unix-millis timestamp of last successful embed request (0 = never used).
+static EMBEDDER_LAST_USED: AtomicU64 = AtomicU64::new(0);
+
+/// Guard: idle-shutdown background task spawned at most once.
+static IDLE_MONITOR_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// Port file path for the embedder PID.
 fn embedder_pid_path() -> Option<std::path::PathBuf> {
@@ -241,6 +247,7 @@ pub async fn ensure_embedder() {
     if http_health().await.unwrap_or(false) {
         EMBEDDER_CHECKED.store(true, Ordering::Relaxed);
         tracing::info!("embedder already running");
+        spawn_idle_monitor();
         return;
     }
 
@@ -288,6 +295,12 @@ pub async fn ensure_embedder() {
 
     match std::process::Command::new(&binary)
         .env("OPENCODE_EMBED_HTTP_PORT", port.to_string())
+        // Cap thread counts in the embedder subprocess to reduce CPU pressure.
+        .env("OMP_NUM_THREADS", "2")
+        .env("MKL_NUM_THREADS", "2")
+        .env("ORT_NUM_THREADS", "2")
+        .env("OPENBLAS_NUM_THREADS", "2")
+        .env("TOKENIZERS_PARALLELISM", "false")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -307,6 +320,8 @@ pub async fn ensure_embedder() {
             if wait_for_embedder(90).await {
                 tracing::info!("embedder healthy on port {}", port);
                 EMBEDDER_CHECKED.store(true, Ordering::Relaxed);
+                touch_last_used();
+                spawn_idle_monitor();
             } else {
                 tracing::error!("embedder failed to become healthy after 90s, killing and resetting");
                 unsafe { libc::kill(pid as i32, libc::SIGTERM); }
@@ -337,6 +352,46 @@ async fn wait_for_embedder(timeout_secs: u64) -> bool {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     false
+}
+
+/// Spawn (at most once) a background task that shuts down the embedder after
+/// OPENCODE_INDEXER_EMBEDDER_IDLE_SECS of inactivity (default 300s).
+/// After shutdown, EMBEDDER_CHECKED is cleared so the next embed call re-spawns.
+fn spawn_idle_monitor() {
+    // OnceLock ensures we spawn at most one monitor per process lifetime.
+    IDLE_MONITOR_STARTED.get_or_init(|| {
+        tokio::spawn(async move {
+            let idle_secs = std::env::var("OPENCODE_INDEXER_EMBEDDER_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300);
+            let threshold = Duration::from_secs(idle_secs);
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let last = EMBEDDER_LAST_USED.load(Ordering::Relaxed);
+                // last == 0 means embedder was never used for actual work — skip
+                if last == 0 {
+                    continue;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let elapsed = Duration::from_millis(now.saturating_sub(last));
+                if elapsed >= threshold {
+                    tracing::info!(
+                        "embedder idle for {}s (threshold {}s), shutting down",
+                        elapsed.as_secs(),
+                        idle_secs
+                    );
+                    shutdown_embedder();
+                    // Clear checked so next embed request re-spawns lazily
+                    EMBEDDER_CHECKED.store(false, Ordering::SeqCst);
+                    EMBEDDER_LAST_USED.store(0, Ordering::SeqCst);
+                }
+            }
+        });
+    });
 }
 
 /// Shut down the embedder if we spawned it.
@@ -391,6 +446,16 @@ fn is_retryable_error(e: &anyhow::Error) -> bool {
 /// If the first attempt fails with a connection error the embedder is reset,
 /// `ensure_embedder` is called again, and the operation is retried up to
 /// `MAX_RETRIES` times.  Any other error is returned immediately.
+/// Record current time as last embed usage (unix millis).
+fn touch_last_used() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    EMBEDDER_LAST_USED.store(ms, Ordering::Relaxed);
+}
+
 async fn with_embedder_recovery<T, F, Fut>(op: F) -> Result<T>
 where
     F: Fn() -> Fut,
@@ -400,7 +465,10 @@ where
     let mut failures = 0u32;
     loop {
         match op().await {
-            Ok(v) => return Ok(v),
+            Ok(v) => {
+                touch_last_used();
+                return Ok(v);
+            }
             Err(e) if failures < MAX_RETRIES && is_retryable_error(&e) => {
                 failures += 1;
                 tracing::warn!(
@@ -782,9 +850,11 @@ pub fn recommended_concurrency() -> usize {
     16
 }
 
-/// Always false — HTTP mode connects to a local server.
+/// Returns true when running against a remote (non-local) embedding server.
+/// Set OPENCODE_INDEXER_REMOTE=1 to enable remote mode.
+/// TODO: wire remote endpoint URL and auth when remote infrastructure is added.
 pub fn is_remote_mode() -> bool {
-    false
+    std::env::var("OPENCODE_INDEXER_REMOTE").as_deref() == Ok("1")
 }
 
 /// No-op warmup (HTTP connections are stateless).

@@ -139,35 +139,37 @@ struct PendingChanges {
     changed: HashSet<PathBuf>,
     /// Files that were deleted  
     deleted: HashSet<PathBuf>,
-    /// Notify channel to signal processing task (Arc so it can be cloned for waiting)
-    notify: Arc<tokio::sync::Notify>,
+    /// Watch channel sender: bumps a counter on each change.
+    /// Receivers call `.changed().await` — level-triggered-on-change, no stored permits.
+    tx: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl PendingChanges {
     fn new() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(0u64);
         Self {
             changed: HashSet::new(),
             deleted: HashSet::new(),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            tx: Arc::new(tx),
         }
     }
 
-    /// Add changed files and notify processor
+    /// Add changed files and signal processor
     fn add_changed(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
             self.deleted.remove(&path); // Changed overrides deleted
             self.changed.insert(path);
         }
-        self.notify.notify_one();
+        self.tx.send_modify(|v| *v = v.wrapping_add(1));
     }
 
-    /// Add deleted files and notify processor
+    /// Add deleted files and signal processor
     fn add_deleted(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
             self.changed.remove(&path); // Deleted overrides changed
             self.deleted.insert(path);
         }
-        self.notify.notify_one();
+        self.tx.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Drain all pending changes, returns (changed, deleted)
@@ -185,9 +187,10 @@ impl PendingChanges {
         self.changed.len() + self.deleted.len()
     }
 
-    /// Get a clone of the notify handle for waiting without holding the lock
-    fn notify_handle(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.notify)
+    /// Get a watch receiver for this pending queue.
+    /// Call `.changed().await` on the receiver — wakes only on *new* sends.
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tx.subscribe()
     }
 }
 
@@ -1057,11 +1060,17 @@ fn link_index_inflight() -> &'static tokio::sync::Mutex<HashSet<PathBuf>> {
 }
 
 /// Adaptive semaphore for linked project indexing.
-/// Total budget of 8 permits allows multiple small projects to index concurrently
-/// while large projects consume more permits to avoid overwhelming the embedder.
+/// Total budget of 4 permits (default) limits concurrent linked-project indexing.
+/// Override via OPENCODE_INDEXER_LINK_CONCURRENCY env var.
 fn link_index_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SEM.get_or_init(|| tokio::sync::Semaphore::new(8))
+    SEM.get_or_init(|| {
+        let permits = std::env::var("OPENCODE_INDEXER_LINK_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(permits)
+    })
 }
 
 /// Determine how many semaphore permits a linked project should consume
@@ -1074,6 +1083,23 @@ fn link_index_weight(files: usize) -> u32 {
         2 // medium: up to 4 concurrent
     } else {
         4 // large: up to 2 concurrent
+    }
+}
+
+/// Check whether a linked project needs initial indexing.
+/// Returns true if the LanceDB directory is missing or contains zero chunks.
+async fn needs_initial_index(db: &std::path::Path) -> bool {
+    if !tokio::fs::try_exists(db).await.unwrap_or(false) {
+        return true;
+    }
+    // Check lance data file as a quick existence proxy (avoid full Storage open for hot path)
+    if !db.join("chunks.lance").exists() {
+        return true;
+    }
+    // Open storage to verify row count; treat errors as "needs index"
+    match cached_storage(db, 0).await {
+        Ok(s) => s.count_chunks().await.unwrap_or(0) == 0,
+        Err(_) => true,
     }
 }
 
@@ -2429,6 +2455,14 @@ async fn search_single_index(
     Ok(out)
 }
 
+/// Returns embed concurrency from env var OPENCODE_INDEXER_EMBED_CONCURRENCY (default 3).
+fn embed_concurrency() -> usize {
+    std::env::var("OPENCODE_INDEXER_EMBED_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
 // ============================================================================
 // run_index — full project indexing via existing run_indexing pipeline
 // ============================================================================
@@ -2484,7 +2518,7 @@ async fn run_index_impl(
         false, // verbose
         exclude,
         &include_paths,
-        5,     // concurrency
+        embed_concurrency(),     // concurrency
         None,  // scan_concurrency
         false, // quiet
         false, // json_lines
@@ -3148,7 +3182,7 @@ async fn startup_check_impl(
                         false, // verbose
                         &[],   // exclude
                         &[],   // include
-                        5,     // concurrency
+                        embed_concurrency(),     // concurrency
                         None,  // scan_concurrency
                         true,  // quiet
                         false, // json_lines
@@ -3269,7 +3303,7 @@ async fn startup_check_impl(
                 false, // verbose
                 &[],   // exclude
                 &[],   // include
-                5,     // concurrency
+                embed_concurrency(),     // concurrency
                 None,  // scan_concurrency
                 true,  // quiet
                 false, // json_lines
@@ -3870,9 +3904,9 @@ fn watcher_start_internal<'a>(
         tracing::info!("started internal watcher for {}", root);
 
         // Trigger linked project indexing in background after watcher starts.
-        // This ensures linked projects get indexed automatically when a watcher starts,
-        // not only when the user explicitly runs /index.
-        {
+        // Only indexes linked projects whose index is missing or empty.
+        // Gate: OPENCODE_INDEXER_DISABLE_LINK_CASCADE=1 disables entirely.
+        if std::env::var("OPENCODE_INDEXER_DISABLE_LINK_CASCADE").as_deref() != Ok("1") {
             let root_for_links = root.to_string();
             let tier_for_links = tier.to_string();
             let dims_for_links = dimensions;
@@ -3885,29 +3919,38 @@ fn watcher_start_internal<'a>(
                 })
                 .await
                 .unwrap_or_default();
-                if !links.is_empty() {
-                    tracing::info!(
-                        "auto-indexing {} linked projects after watcher start",
-                        links.len()
-                    );
-                    for link in links {
-                        ensure_link_index(link, &tier_for_links, dims_for_links, &root_for_links)
-                            .await;
+                // Filter to only links that need indexing (missing or empty index)
+                let mut stale = Vec::new();
+                for link in links {
+                    if needs_initial_index(&link.db).await {
+                        stale.push(link);
                     }
+                }
+                if stale.is_empty() {
+                    tracing::debug!("link cascade T+2s: all linked indexes up-to-date, skipping");
+                    return;
+                }
+                tracing::info!(
+                    "auto-indexing {} linked projects after watcher start",
+                    stale.len()
+                );
+                for link in stale {
+                    ensure_link_index(link, &tier_for_links, dims_for_links, &root_for_links)
+                        .await;
                 }
             });
         }
         // After linked project indexing, start watchers for linked projects via dispatch_unified.
-        // Using dispatch_unified (not watcher_start_internal directly) avoids recursive async
-        // type inference issues that make tokio::spawn require Send.
-        {
+        // Only starts watchers for projects whose index already exists (current or just built).
+        // Gate: OPENCODE_INDEXER_DISABLE_LINK_CASCADE=1 disables entirely.
+        if std::env::var("OPENCODE_INDEXER_DISABLE_LINK_CASCADE").as_deref() != Ok("1") {
             let root_for_links = root.to_string();
             let tier_for_links = tier.to_string();
             let state_for_links = state.clone();
             tokio::spawn(async move {
                 // Wait for indexing to complete (2s init + indexing time + buffer)
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                // Collect (repo, db) pairs synchronously; filter by existing index
+                // Collect (repo, db) pairs; only for projects whose index exists and is non-empty
                 let pairs: Vec<(String, String)> = tokio::task::spawn_blocking({
                     let root = root_for_links.clone();
                     move || {
@@ -4766,9 +4809,14 @@ pub async fn run(port: u16) -> Result<()> {
         let shutdown_rx = shutdown_rx.clone();
         let compaction_tx = compaction_tx.clone();
         tokio::spawn(async move {
-            // Minimum batch interval to avoid thrashing
-            // Use 500ms (not 200ms) to reduce CPU wakeups in continuous loop
-            let min_batch_interval = Duration::from_millis(500);
+            // Minimum batch interval to coalesce rapid changes and reduce CPU wakeups.
+            // Default: 2000ms. Override via OPENCODE_INDEXER_BATCH_INTERVAL_MS.
+            let min_batch_interval = Duration::from_millis(
+                std::env::var("OPENCODE_INDEXER_BATCH_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(2000),
+            );
 
             loop {
                 // Wait for any watcher to have pending changes OR timeout for periodic check
@@ -5026,6 +5074,8 @@ pub async fn run(port: u16) -> Result<()> {
                         }
                     }
                 }
+                // Floor sleep between drain cycles to prevent residual spin
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
             tracing::info!("watcher processor shutting down");
@@ -5037,7 +5087,13 @@ pub async fn run(port: u16) -> Result<()> {
         let state = state.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let min_batch_interval = Duration::from_millis(500);
+            // Default: 2000ms. Override via OPENCODE_INDEXER_BATCH_INTERVAL_MS.
+            let min_batch_interval = Duration::from_millis(
+                std::env::var("OPENCODE_INDEXER_BATCH_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(2000),
+            );
 
             loop {
                 // Wait for any memory watcher to have pending changes
@@ -5241,6 +5297,8 @@ pub async fn run(port: u16) -> Result<()> {
                         }
                     }
                 }
+                // Floor sleep between drain cycles to prevent residual spin
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
             tracing::info!("memory watcher processor shutting down");
@@ -5252,7 +5310,12 @@ pub async fn run(port: u16) -> Result<()> {
         let state = state.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let retry_interval = Duration::from_secs(30);
+            let retry_interval = Duration::from_secs(
+                std::env::var("OPENCODE_INDEXER_MEMORY_RETRY_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(300),
+            );
 
             let mut shutdown_rx = shutdown_rx.clone();
 
@@ -5554,103 +5617,88 @@ pub async fn run(port: u16) -> Result<()> {
     std::process::exit(0);
 }
 
-// Helper function to wait for any watcher to have pending changes
+// Helper function to wait for any watcher to have pending changes.
+// Uses watch::Receiver::changed() which is level-triggered-on-change and has
+// no stored-permit problem (unlike Notify::notified()).
 async fn wait_for_any_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    // Get notify handles and check if any have pending changes
-    // IMPORTANT: We clone the Arc<Notify> so we can wait WITHOUT holding the mutex
-    let (notify_handles, has_pending): (Vec<Arc<tokio::sync::Notify>>, bool) = {
+    // Collect watch receivers and check for already-pending changes.
+    // Subscribing via pending.subscribe() creates a fresh receiver marked-as-seen
+    // at the current value, so only *future* sends will wake it.
+    let (rxs, has_pending): (Vec<tokio::sync::watch::Receiver<u64>>, bool) = {
         let s = state.lock().await;
-        let mut has_pending = false;
+        let mut pending = false;
         let mut handles = Vec::new();
-
         for w in s.watchers.values() {
-            // Try to check pending without blocking
-            if let Ok(pending) = w.pending.try_lock() {
-                if !pending.is_empty() {
-                    has_pending = true;
+            if let Ok(p) = w.pending.try_lock() {
+                if !p.is_empty() {
+                    pending = true;
                 }
-                // Clone the notify handle so we can wait on it without holding the mutex
-                handles.push(pending.notify_handle());
+                handles.push(p.subscribe());
             }
         }
-        (handles, has_pending)
+        (handles, pending)
     };
-    // Lock is released here
 
-    // If there are already pending changes, return immediately
     if has_pending {
         return;
     }
 
-    if notify_handles.is_empty() {
-        // No watchers registered — sleep for the full outer timeout duration
+    if rxs.is_empty() {
         tokio::time::sleep(Duration::from_secs(300)).await;
         return;
     }
 
-    // Wait for any notification WITHOUT holding any locks
-    // Each notify handle is an Arc<Notify>, so we can wait on it directly
-    let mut futures = FuturesUnordered::new();
-    for notify in notify_handles {
-        futures.push(async move {
-            notify.notified().await;
-        });
-    }
+    // Wait for any watcher to signal new changes.
+    let mut futs: FuturesUnordered<_> = rxs
+        .into_iter()
+        .map(|mut rx| Box::pin(async move { rx.changed().await }))
+        .collect();
 
-    // Wait for the first notification to complete
-    match futures.next().await {
-        Some(_) => {
-            // Got a notification, return to process pending changes
-        }
+    match futs.next().await {
+        Some(_) => {}
         None => {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }
 
-/// Wait for any memory watcher to have pending changes (async, non-blocking)
+/// Wait for any memory watcher to have pending changes (async, non-blocking).
+/// Uses watch::Receiver::changed() — level-triggered-on-change, no stored-permit spin.
 async fn wait_for_any_memory_pending(state: &Arc<tokio::sync::Mutex<DaemonState>>) {
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    // Get notify handles and check if any have pending changes
-    let (notify_handles, has_pending): (Vec<Arc<tokio::sync::Notify>>, bool) = {
+    let (rxs, has_pending): (Vec<tokio::sync::watch::Receiver<u64>>, bool) = {
         let s = state.lock().await;
-        let mut has_pending = false;
+        let mut pending = false;
         let mut handles = Vec::new();
-
         for w in s.memory_watchers.values() {
-            if let Ok(pending) = w.pending.try_lock() {
-                if !pending.is_empty() {
-                    has_pending = true;
+            if let Ok(p) = w.pending.try_lock() {
+                if !p.is_empty() {
+                    pending = true;
                 }
-                handles.push(pending.notify_handle());
+                handles.push(p.subscribe());
             }
         }
-        (handles, has_pending)
+        (handles, pending)
     };
 
-    // If there are already pending changes, return immediately
     if has_pending {
         return;
     }
 
-    if notify_handles.is_empty() {
-        // No watchers registered — sleep for the full outer timeout duration
+    if rxs.is_empty() {
         tokio::time::sleep(Duration::from_secs(300)).await;
         return;
     }
 
-    // Wait for any notification
-    let mut futures = FuturesUnordered::new();
-    for notify in notify_handles {
-        futures.push(async move {
-            notify.notified().await;
-        });
-    }
+    let mut futs: FuturesUnordered<_> = rxs
+        .into_iter()
+        .map(|mut rx| Box::pin(async move { rx.changed().await }))
+        .collect();
 
-    match futures.next().await {
+    match futs.next().await {
         Some(_) => {}
         None => {
             tokio::time::sleep(Duration::from_millis(500)).await;
