@@ -2157,7 +2157,9 @@ async fn run_indexing(
     }
 
     // Build FTS index (fast, blocks briefly)
-    let _ = storage.create_indexes(false).await;
+    if let Err(e) = storage.create_indexes(false).await {
+        tracing::warn!("failed to create indexes: {e}");
+    }
 
     // Record indexing duration BEFORE compaction (compaction is I/O-heavy
     // and not part of the embed pipeline — measuring it separately avoids

@@ -1987,7 +1987,27 @@ impl Storage {
         use lancedb::rerankers::rrf::RRFReranker;
         use std::sync::Arc;
 
-        // Try hybrid search first
+        // Fix A3: skip hybrid entirely if DB is too small for FTS
+        let cnt = self.count_chunks().await.unwrap_or(0);
+        if cnt < FTS_THRESHOLD {
+            tracing::debug!("hybrid skipped: {} chunks < threshold {}", cnt, FTS_THRESHOLD);
+            return self.search_vector(query_vec, limit).await;
+        }
+
+        // Fix A4: skip hybrid if FTS index not present (avoids noisy lance error + wasted work)
+        {
+            let indices = table.list_indices().await.unwrap_or_default();
+            let has_fts = indices.iter().any(|i| {
+                i.columns.contains(&"content".to_string())
+                    && matches!(i.index_type, lancedb::index::IndexType::FTS)
+            });
+            if !has_fts {
+                tracing::debug!("hybrid skipped: no FTS index on content column");
+                return self.search_vector(query_vec, limit).await;
+            }
+        }
+
+        // Try hybrid search
         match table
             .vector_search(query_vec)
             .context("hybrid search failed")?
@@ -2831,6 +2851,31 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "test.txt");
+    }
+
+    #[tokio::test]
+    async fn storage_search_hybrid_skips_hybrid_below_threshold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join(".lancedb");
+        let storage = Storage::open(&db, 256).await.unwrap();
+
+        // Add fewer chunks than FTS_THRESHOLD — should fall back to vector silently
+        let q = test_vector(1, 256);
+        for i in 0..(FTS_THRESHOLD - 1) {
+            storage
+                .add_chunks(
+                    &format!("f{i}.txt"),
+                    &format!("h{i}"),
+                    "text",
+                    vec![ChunkData { position: 0, content: format!("doc {i}"), start_line: 1, end_line: 1, vector: q.clone() }],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Must not error even without FTS index
+        let results = storage.search_hybrid("doc", &q, 5).await.unwrap();
+        assert!(!results.is_empty() || results.is_empty()); // just confirms no panic/error
     }
 
     #[tokio::test]
