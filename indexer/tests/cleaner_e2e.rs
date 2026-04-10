@@ -162,7 +162,8 @@ fn e2e_scan_reports_correct_sizes() {
     fs::create_dir_all(base.join("projects")).unwrap();
     make_project(base, "sized_proj", Some("/nonexistent/sized"));
 
-    let projects = cleaner::scan(base);
+    // scan() is shallow (bytes=0 by design); use scan_deep() for size assertions
+    let projects = cleaner::scan_deep(base);
     assert_eq!(projects.len(), 1);
     // .lancedb/chunks.dat (4096) + memories/note.md (~24) + .symlinks.json (~80) > 4000
     assert!(
