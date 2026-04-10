@@ -4691,23 +4691,51 @@ pub async fn run(port: u16) -> Result<()> {
     }
 
     // Filesystem-event-driven project directory cleanup task.
-    // Watches projects/ and shared_data_dir/ for directory-level changes
-    // (orphan detection) and keeps a 24 h fallback timer for stale detection.
+    // Watches projects/ for DELETION events only (orphan detection).
+    // 24h fallback timer handles stale detection with a full deep scan.
+    //
+    // Fix: event filter (deletions only), 60s cooldown, 30s debounce, batched scan.
     {
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            use notify::Watcher as _;
+            use notify::{EventKind, Watcher as _};
+            use notify::event::{ModifyKind, RemoveKind};
+
             let cfg = crate::cleaner::config();
             let base = crate::storage::shared_data_dir();
 
+            // Cooldown: minimum seconds between consecutive cleanup runs.
+            // Prevents self-triggering feedback loop (cleanup modifies projects/ → inotify fires again).
+            let cooldown = Duration::from_secs(
+                std::env::var("OPENCODE_INDEXER_CLEANUP_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(60),
+            );
+            // Debounce: how long to wait after first event before running.
+            let debounce = Duration::from_secs(
+                std::env::var("OPENCODE_INDEXER_CLEANUP_DEBOUNCE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(30),
+            );
+
             // notify → std::sync::mpsc (sync callback thread)
-            let (sync_tx, sync_rx) = std::sync::mpsc::channel::<notify::Event>();
+            // Fix 1: Only forward deletion/rename events — ignore Create, Modify::Data, Access.
+            let (sync_tx, sync_rx) = std::sync::mpsc::channel::<()>();
             let mut watcher = match notify::RecommendedWatcher::new(
                 {
                     let tx = sync_tx.clone();
                     move |res: notify::Result<notify::Event>| {
-                        if let Ok(evt) = res {
-                            let _ = tx.send(evt);
+                        let Ok(evt) = res else { return };
+                        let relevant = matches!(
+                            evt.kind,
+                            EventKind::Remove(RemoveKind::Folder)
+                            | EventKind::Remove(RemoveKind::Any)
+                            | EventKind::Modify(ModifyKind::Name(_))
+                        );
+                        if relevant {
+                            let _ = tx.send(());
                         }
                     }
                 },
@@ -4727,7 +4755,7 @@ pub async fn run(port: u16) -> Result<()> {
                 tracing::warn!("cleanup watcher: failed to watch base dir: {}", e);
             }
 
-            // Watch projects/ for orphan detection — create dir first if absent
+            // Watch projects/ for orphan detection (deletions only) — create dir first if absent
             let projects = base.join("projects");
             if !projects.exists() {
                 let _ = std::fs::create_dir_all(&projects);
@@ -4739,24 +4767,28 @@ pub async fn run(port: u16) -> Result<()> {
             }
 
             // std::sync::mpsc → tokio::sync::mpsc bridge thread
-            // Collapses all events into a unit signal; watcher kept alive here
             let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<()>(64);
             std::thread::spawn(move || {
                 let _w = watcher; // keep watcher alive
                 while sync_rx.recv().is_ok() {
-                    // Drop signal if channel is full — we only need "something changed"
                     let _ = async_tx.try_send(());
                 }
             });
 
-            // Async cleanup loop: event-driven with 24 h fallback for stale detection
+            // Track last cleanup time for cooldown enforcement.
+            // Initialize to startup minus (cooldown - 10s) so first event fires after 10s grace.
+            let mut last = tokio::time::Instant::now()
+                .checked_sub(cooldown.saturating_sub(Duration::from_secs(10)))
+                .unwrap_or_else(tokio::time::Instant::now);
+            #[allow(unused_assignments)]
+            let mut is_fallback = false;
+
+            // Async cleanup loop: event-driven (batched) with 24h fallback (deep scan)
             let mut fallback = tokio::time::interval(crate::cleaner::interval());
-            // Skip immediate first tick — don't clean on startup
-            fallback.tick().await;
+            fallback.tick().await; // skip immediate first tick
 
             loop {
                 tokio::select! {
-                    // Event path: directory created/deleted under watched dirs
                     msg = async_rx.recv() => {
                         if msg.is_none() {
                             break; // bridge thread exited
@@ -4764,40 +4796,73 @@ pub async fn run(port: u16) -> Result<()> {
                         if *shutdown_rx.borrow() {
                             break;
                         }
-                        // 5 s debounce — cleanup is heavyweight, batch rapid events
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        // Drain any signals that arrived during the sleep, yielding to scheduler
+                        // Fix 2: cooldown guard — skip if we cleaned too recently
+                        if last.elapsed() < cooldown {
+                            // Drain excess signals; don't schedule another run
+                            while async_rx.try_recv().is_ok() {}
+                            continue;
+                        }
+                        // Fix 3: 30s debounce to batch rapid burst events
+                        tokio::time::sleep(debounce).await;
                         while async_rx.try_recv().is_ok() {
                             tokio::task::yield_now().await;
                         }
                         if *shutdown_rx.borrow() {
                             break;
                         }
+                        is_fallback = false;
                     }
-                    // Fallback path: stale detection is time-based, not event-driven
                     _ = fallback.tick() => {
                         if *shutdown_rx.borrow() {
                             break;
                         }
+                        is_fallback = true;
                     }
                 }
-                tracing::info!("running project cleanup");
-                let c = cfg.clone();
-                let b = base.clone();
-                match tokio::task::spawn_blocking(move || crate::cleaner::run(&b, &c, false)).await
-                {
-                    Ok(report) => {
-                        if report.orphans > 0 || report.stale > 0 || report.aux_dirs > 0 {
-                            tracing::info!(
-                                "cleanup complete: {} orphans, {} stale, {} aux dirs removed, {} bytes freed",
-                                report.orphans, report.stale, report.aux_dirs, report.freed
-                            );
+
+                last = tokio::time::Instant::now();
+
+                if is_fallback {
+                    // 24h path: full deep scan for stale detection
+                    tracing::info!("running project cleanup (full 24h pass)");
+                    let c = cfg.clone();
+                    let b = base.clone();
+                    match tokio::task::spawn_blocking(move || crate::cleaner::run(&b, &c, false)).await {
+                        Ok(report) => {
+                            if report.orphans > 0 || report.stale > 0 || report.aux_dirs > 0 {
+                                tracing::info!(
+                                    "cleanup complete: {} orphans, {} stale, {} aux dirs removed, {} bytes freed",
+                                    report.orphans, report.stale, report.aux_dirs, report.freed
+                                );
+                            }
+                            for err in &report.errors {
+                                tracing::warn!("cleanup error: {}", err);
+                            }
                         }
-                        for err in &report.errors {
-                            tracing::warn!("cleanup error: {}", err);
-                        }
+                        Err(e) => tracing::warn!("cleanup task failed: {}", e),
                     }
-                    Err(e) => tracing::warn!("cleanup task failed: {}", e),
+                } else {
+                    // Event path: batched shallow scan (Fix 4 — at most batch_size dirs per run)
+                    tracing::debug!("running project cleanup (batched event pass)");
+                    let c = cfg.clone();
+                    let b = base.clone();
+                    match tokio::task::spawn_blocking(move || crate::cleaner::run_batch(&b, &c, false)).await {
+                        Ok((report, complete)) => {
+                            if report.orphans > 0 || report.stale > 0 {
+                                tracing::info!(
+                                    "cleanup batch: {} orphans, {} stale removed",
+                                    report.orphans, report.stale
+                                );
+                            }
+                            for err in &report.errors {
+                                tracing::warn!("cleanup error: {}", err);
+                            }
+                            if complete {
+                                tracing::debug!("cleanup batch: full pass complete");
+                            }
+                        }
+                        Err(e) => tracing::warn!("cleanup batch task failed: {}", e),
+                    }
                 }
             }
         });

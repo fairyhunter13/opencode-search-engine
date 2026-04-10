@@ -113,7 +113,7 @@ pub struct Report {
     pub targets: Vec<Target>,
 }
 
-/// Compute directory size recursively.
+/// Compute directory size recursively (expensive — only used by 24h fallback path).
 fn dir_size(path: &Path) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -124,7 +124,14 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-/// Get the latest modification time of any file in a directory.
+/// Get the top-level mtime of a directory via a single stat() call.
+/// Fast O(1) replacement for the recursive latest_modified used in normal cleanup.
+fn dir_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Get the latest modification time of any file in a directory (full walkdir).
+/// Only used when stale detection needs deep mtime accuracy (24h fallback path).
 fn latest_modified(path: &Path) -> Option<SystemTime> {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -141,8 +148,47 @@ fn read_root(dir: &Path) -> Option<String> {
     json.get("project_root")?.as_str().map(String::from)
 }
 
+/// Cursor file path for batched scan resumption.
+fn cursor_path(base: &Path) -> std::path::PathBuf {
+    // Write cursor OUTSIDE projects/ to avoid triggering inotify on projects/
+    base.join("cleaner_cursor")
+}
+
+/// Read the current cursor offset from disk (0 if absent/invalid).
+fn read_cursor(base: &Path) -> usize {
+    std::fs::read_to_string(cursor_path(base))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Write the cursor offset to disk.
+fn write_cursor(base: &Path, offset: usize) {
+    let _ = std::fs::write(cursor_path(base), offset.to_string());
+}
+
+/// Batch size for each scan invocation (default 500, env OPENCODE_INDEXER_CLEANUP_BATCH).
+fn batch_size() -> usize {
+    std::env::var("OPENCODE_INDEXER_CLEANUP_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+}
+
 /// Scan all project directories under the shared data dir.
+/// Uses shallow stat (O(1) per dir) instead of recursive walkdir.
+/// Called by identify() which handles the orphan/stale logic.
 pub fn scan(base: &Path) -> Vec<ProjectInfo> {
+    scan_full(base, false)
+}
+
+/// Full scan using recursive walkdir for deep mtime/size accuracy.
+/// Only called by the 24h fallback path.
+pub fn scan_deep(base: &Path) -> Vec<ProjectInfo> {
+    scan_full(base, true)
+}
+
+fn scan_full(base: &Path, deep: bool) -> Vec<ProjectInfo> {
     let dir = base.join("projects");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
@@ -154,8 +200,12 @@ pub fn scan(base: &Path) -> Vec<ProjectInfo> {
             let path = e.path();
             let id = e.file_name().to_string_lossy().to_string();
             let root = read_root(&path);
-            let bytes = dir_size(&path);
-            let modified = latest_modified(&path);
+            // Use cheap O(1) stat for event-driven path; deep walkdir only for 24h pass
+            let (bytes, modified) = if deep {
+                (dir_size(&path), latest_modified(&path))
+            } else {
+                (0u64, dir_mtime(&path))
+            };
             ProjectInfo {
                 path,
                 id,
@@ -165,6 +215,48 @@ pub fn scan(base: &Path) -> Vec<ProjectInfo> {
             }
         })
         .collect()
+}
+
+/// Batched scan: process at most `batch_size` entries per call, resuming via cursor.
+/// Returns (infos, complete) where complete=true when a full pass has finished.
+pub fn scan_batch(base: &Path) -> (Vec<ProjectInfo>, bool) {
+    let dir = base.join("projects");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return (vec![], true);
+    };
+    // Collect and sort IDs for stable cursor ordering
+    let mut ids: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    ids.sort();
+
+    let total = ids.len();
+    let cursor = read_cursor(base).min(total);
+    let batch = batch_size();
+    let end = (cursor + batch).min(total);
+    let complete = end >= total;
+    let next = if complete { 0 } else { end };
+    write_cursor(base, next);
+
+    let infos: Vec<ProjectInfo> = ids[cursor..end]
+        .iter()
+        .map(|id| {
+            let path = dir.join(id);
+            let root = read_root(&path);
+            let modified = dir_mtime(&path);
+            ProjectInfo {
+                path,
+                id: id.clone(),
+                root,
+                bytes: 0,
+                modified,
+            }
+        })
+        .collect();
+
+    (infos, complete)
 }
 
 /// Identify projects that should be cleaned up.
@@ -228,11 +320,42 @@ fn aux_dirs(base: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Execute cleanup: remove orphaned/stale project dirs and auxiliary dirs.
+/// Execute cleanup using batched shallow scan (event-driven path).
+/// Returns (report, complete) where complete=true after a full pass.
+pub fn run_batch(base: &Path, cfg: &Config, dry: bool) -> (Report, bool) {
+    let mut report = Report::default();
+    let (projects, complete) = scan_batch(base);
+    let targets = identify(&projects, cfg);
+
+    for target in &targets {
+        // bytes=0 in batch path (shallow scan) — compute only when deleting
+        let size = if !dry { dir_size(&target.info.path) } else { 0 };
+        if !dry {
+            if let Err(e) = std::fs::remove_dir_all(&target.info.path) {
+                report.errors.push(format!(
+                    "failed to remove {}: {}",
+                    target.info.path.display(),
+                    e
+                ));
+                continue;
+            }
+        }
+        report.freed += size;
+        match target.reason {
+            Reason::Orphaned => report.orphans += 1,
+            Reason::Stale => report.stale += 1,
+        }
+    }
+    report.targets = targets;
+    (report, complete)
+}
+
+/// Execute full cleanup: remove orphaned/stale project dirs and auxiliary dirs.
+/// Uses deep recursive scan — intended for the 24h fallback timer path.
 /// If `dry` is true, only report what would be cleaned without deleting.
 pub fn run(base: &Path, cfg: &Config, dry: bool) -> Report {
     let mut report = Report::default();
-    let projects = scan(base);
+    let projects = scan_deep(base);
     let targets = identify(&projects, cfg);
 
     for target in &targets {
