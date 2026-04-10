@@ -444,9 +444,16 @@ fn compaction_shutdown_timeout() -> Duration {
 // SQLite connection cache for serialized writes
 // ---------------------------------------------------------------------------
 /// Perform compaction on a database.
+/// Fix B1: compact() runs on a blocking thread pool worker via spawn_blocking+block_on
+/// so Parquet I/O can't starve the tokio async runtime.
 async fn perform_compaction(db_path: &Path, dims: u32) -> Result<()> {
     let storage = crate::storage::Storage::open(db_path, dims).await?;
-    storage.compact().await?;
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(storage.compact())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("compaction thread panicked: {e}"))??;
     Ok(())
 }
 
@@ -482,6 +489,27 @@ async fn compaction_worker(
                     tracing::info!("compaction worker channel closed");
                     break;
                 };
+
+                // Fix B3: per-DB compaction cooldown.
+                // Env OPENCODE_INDEXER_COMPACTION_COOLDOWN_SECS (default 3600).
+                {
+                    let cooldown = std::env::var("OPENCODE_INDEXER_COMPACTION_COOLDOWN_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(3600);
+                    let s = state.lock().await;
+                    if let Some(cs) = s.compaction.get(&req.key) {
+                        if let Some(last) = cs.last_compact_time {
+                            if last.elapsed() < Duration::from_secs(cooldown) {
+                                tracing::debug!(
+                                    "skipping compaction for {} (cooldown {}s not elapsed)",
+                                    req.db_path.display(), cooldown
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 // Skip if already being processed (deduplicate)
                 if in_flight.contains(&req.key) {
@@ -532,6 +560,14 @@ async fn compaction_worker(
 
                 // Remove from in-flight
                 in_flight.remove(&req.key);
+
+                // Fix B2: spacing between consecutive compactions to avoid saturating
+                // blocking thread pool. Default 5s; env OPENCODE_INDEXER_COMPACTION_SPACING_SECS.
+                let spacing = std::env::var("OPENCODE_INDEXER_COMPACTION_SPACING_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(5);
+                tokio::time::sleep(Duration::from_secs(spacing)).await;
             }
         }
     }
@@ -2461,6 +2497,14 @@ fn embed_concurrency() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(3)
+}
+
+/// Session-level set of DB paths where FTS index has been confirmed present.
+/// Avoids calling list_indices() on every watcher batch.
+fn fts_ensured() -> &'static tokio::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static S: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
 // ============================================================================
@@ -5109,6 +5153,25 @@ pub async fn run(port: u16) -> Result<()> {
 
                         use futures::StreamExt as _;
                         while let Some(_) = futs.next().await {}
+
+                        // Fix A2: Ensure FTS index exists after each batch that wrote chunks.
+                        // Skip if already confirmed this session — avoids list_indices() overhead.
+                        {
+                            let db = db_path.as_ref().clone();
+                            let already = fts_ensured().lock().await.contains(&db);
+                            if !already {
+                                let s2 = storage.clone();
+                                let db2 = db.clone();
+                                tokio::spawn(async move {
+                                    match s2.create_fts_index().await {
+                                        Ok(()) => {
+                                            fts_ensured().lock().await.insert(db2);
+                                        }
+                                        Err(e) => tracing::warn!("fts index ensure failed: {e}"),
+                                    }
+                                });
+                            }
+                        }
 
                         // Update last_update_timestamp after successful processing
                         let now = chrono::Utc::now().to_rfc3339();
