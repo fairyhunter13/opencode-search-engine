@@ -127,6 +127,8 @@ struct DaemonState {
     tui_projects: HashSet<String>,
     /// Per-database compaction state for smart deferred compaction.
     compaction: HashMap<String, CompactionState>,
+    /// Sender for the compaction worker queue. Stored here so RPC handlers can queue compaction.
+    compaction_tx: Option<tokio::sync::mpsc::Sender<CompactionRequest>>,
     /// Internal watchers keyed by canonicalized project root
     watchers: HashMap<String, WatcherState>,
     /// Memory watchers keyed by scope (e.g., "global", "project:abc123")
@@ -1712,9 +1714,10 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
         }
 
         "status" => {
+            let root = params["root"].as_str();
             let db = params["db"].as_str();
             let dims: u32 = params["dimensions"].as_u64().unwrap_or(1024) as u32;
-            match status_impl(db, dims).await {
+            match status_impl(root, db, dims).await {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({"error": e.to_string()}),
             }
@@ -2681,7 +2684,7 @@ fn discover_files_impl(
 // status
 // ============================================================================
 
-async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
+async fn status_impl(root: Option<&str>, db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
     let db = db.context("db path required")?;
     let sp = PathBuf::from(db);
     if !tokio::fs::try_exists(&sp).await.unwrap_or(false) {
@@ -2715,8 +2718,22 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
             }
         }
     }
-    let chunks = storage.count_chunks().await.unwrap_or(0);
-    let files = storage.get_indexed_files().await.unwrap_or_default().len();
+    let (chunks, chunks_corrupted) = match storage.count_chunks().await {
+        Ok(c) => (c, false),
+        Err(e) if crate::storage::is_corruption_error(&e) => {
+            tracing::warn!("status: corruption detected in count_chunks: {e:#}");
+            (0, true)
+        }
+        Err(_) => (0, false),
+    };
+    let (files, files_corrupted) = match storage.get_indexed_files().await {
+        Ok(f) => (f.len(), false),
+        Err(e) if crate::storage::is_corruption_error(&e) => {
+            tracing::warn!("status: corruption detected in get_indexed_files: {e:#}");
+            (0, true)
+        }
+        Err(_) => (0, false),
+    };
     let tier = storage.get_tier().await.unwrap_or(None);
 
     let last_duration_ms = storage.get_last_index_duration_ms().await.unwrap_or(None);
@@ -2751,8 +2768,14 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
         .unwrap_or((0, 0));
 
     // Check for index corruption by verifying lance table directories exist
-    let mut corrupted = false;
+    let mut corrupted = files_corrupted || chunks_corrupted;
     let mut corruption_errors: Vec<String> = Vec::new();
+    if files_corrupted {
+        corruption_errors.push("Arrow RecordBatch error in get_indexed_files".into());
+    }
+    if chunks_corrupted {
+        corruption_errors.push("Arrow RecordBatch error in count_chunks".into());
+    }
 
     if chunks > 0 || files > 0 {
         // If we have data, verify the lance tables are intact
@@ -2829,6 +2852,33 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
         }
     }
 
+    // Auto-recover from corruption detected via Arrow/LanceDB errors
+    let mut rebuilding = false;
+    if corrupted {
+        // Dedup guard: don't spawn recovery if indexing is already in progress
+        let already_indexing = storage.get_indexing_in_progress().await.unwrap_or(false);
+        if !already_indexing {
+            if let Some(project_root) = root {
+                let root_owned = project_root.to_string();
+                let tier_str = storage.get_tier().await.unwrap_or(None).unwrap_or_else(|| "budget".to_string());
+                tracing::warn!("status_impl: auto-recovering corrupted index for {root_owned}");
+                if let Ok(true) = crate::storage::clear_corrupted_index(&sp) {
+                    invalidate_storage_cache(&sp).await;
+                    rebuilding = true;
+                    let tier_owned = tier_str.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if let Err(e) = run_index_background(&root_owned, &tier_owned, dims).await {
+                            tracing::warn!("status_impl: background reindex after corruption recovery failed: {e:#}");
+                        }
+                    });
+                }
+            } else {
+                tracing::warn!("status_impl: corruption detected but no project root available for auto-recovery — run /index manually");
+            }
+        }
+    }
+
     Ok(serde_json::json!({
         "exists": true,
         "indexed": files > 0,
@@ -2852,6 +2902,7 @@ async fn status_impl(db: Option<&str>, dims: u32) -> Result<serde_json::Value> {
         "embeddingTotal": embedding_total,
         "corrupted": corrupted,
         "corruptionErrors": corruption_errors,
+        "rebuilding": rebuilding,
     }))
 }
 
@@ -3173,7 +3224,7 @@ async fn startup_check_impl(
     }
 
     // Get status to check for corruption
-    let status = match status_impl(Some(db_path.to_str().unwrap_or("")), dims).await {
+    let status = match status_impl(Some(root), Some(db_path.to_str().unwrap_or("")), dims).await {
         Ok(s) => s,
         Err(e) => {
             // Check if this is a corruption error that we can auto-fix
@@ -4475,6 +4526,38 @@ async fn dispatch_unified(
         };
     }
 
+    if method == "compact" {
+        let db = params["db"].as_str().map(|s| s.to_string());
+        let dims: u32 = params["dimensions"].as_u64().unwrap_or(1024) as u32;
+        return match db {
+            Some(db_path) => {
+                let path = std::path::PathBuf::from(&db_path);
+                let tx = state.lock().await.compaction_tx.clone();
+                match tx {
+                    Some(tx) => {
+                        queue_compaction(&tx, path, dims, "rpc");
+                        serde_json::json!({"queued": true, "message": "compaction queued"})
+                    }
+                    None => serde_json::json!({"error": "compaction worker not initialized"}),
+                }
+            }
+            None => serde_json::json!({"error": "db path required"}),
+        };
+    }
+
+    if method == "compact_status" {
+        let s = state.lock().await;
+        let statuses: Vec<serde_json::Value> = s.compaction.iter().map(|(key, cs)| {
+            serde_json::json!({
+                "db": key,
+                "operations": cs.operations_since_compact,
+                "inProgress": cs.compact_in_progress,
+                "lastCompactSecs": cs.last_compact_time.map(|t| t.elapsed().as_secs()),
+            })
+        }).collect();
+        return serde_json::json!({"compaction": statuses});
+    }
+
     // All read-only stateless operations.
     handle_request(&method, &params).await
 }
@@ -4603,6 +4686,7 @@ pub async fn run(port: u16) -> Result<()> {
         tui_connections: HashMap::new(),
         tui_projects: HashSet::new(),
         compaction: HashMap::new(),
+        compaction_tx: None,
         watchers: HashMap::new(),
         memory_watchers: HashMap::new(),
     }));
@@ -4614,6 +4698,12 @@ pub async fn run(port: u16) -> Result<()> {
         let state = state.clone();
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(compaction_worker(compaction_rx, state, shutdown_rx));
+    }
+
+    // Store compaction_tx in state so RPC handlers can access it
+    {
+        let mut s = state.lock().await;
+        s.compaction_tx = Some(compaction_tx.clone());
     }
 
     // Start built-in memory watchers (global memories)
@@ -6038,6 +6128,7 @@ mod compaction_tests {
             tui_connections: HashMap::new(),
             tui_projects: HashSet::new(),
             compaction: HashMap::new(),
+            compaction_tx: None,
             watchers: HashMap::new(),
             memory_watchers: HashMap::new(),
         };
@@ -6061,6 +6152,7 @@ mod compaction_tests {
             tui_connections: HashMap::new(),
             tui_projects: HashSet::new(),
             compaction: HashMap::new(),
+            compaction_tx: None,
             watchers: HashMap::new(),
             memory_watchers: HashMap::new(),
         };
@@ -6084,6 +6176,7 @@ mod compaction_tests {
             tui_connections: HashMap::new(),
             tui_projects: HashSet::new(),
             compaction: HashMap::new(),
+            compaction_tx: None,
             watchers: HashMap::new(),
             memory_watchers: HashMap::new(),
         };
@@ -6468,6 +6561,7 @@ mod http_dispatch_tests {
             tui_connections: HashMap::new(),
             tui_projects: HashSet::new(),
             compaction: HashMap::new(),
+            compaction_tx: None,
             watchers: HashMap::new(),
             memory_watchers: HashMap::new(),
         }))

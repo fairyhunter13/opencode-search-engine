@@ -88,6 +88,12 @@ pub fn is_corruption_error(err: &anyhow::Error) -> bool {
         || msg.contains("table") && msg.contains("was not found")
         // Intentionally NOT matching the broader "table" + "not found" pattern because
         // messages like "table 'config' not found" are normal for a fresh database.
+        // Arrow RecordBatch size mismatch — occurs when lance-0.23.x merges batches
+        // with inconsistent row counts (e.g., "20 != 19"). Not matched by the IO/Arrow
+        // categories above so we add it explicitly.
+        || msg.contains("recordbatch") && msg.contains("different sizes")
+        || msg.contains("invalid argument error") && msg.contains("merge")
+        || msg.contains("lanceerror(arrow)") && msg.contains("invalid argument")
 }
 
 /// Clear a corrupted LanceDB index by removing the .lancedb directory.
@@ -1100,7 +1106,7 @@ impl Storage {
                 }
             }
 
-            let results = table
+            let results = match table
                 .query()
                 .select(lancedb::query::Select::Columns(vec![
                     "path".into(),
@@ -1109,10 +1115,29 @@ impl Storage {
                 .limit(page_size)
                 .offset(offset)
                 .execute()
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = anyhow::anyhow!("{}", e);
+                    if is_corruption_error(&err) {
+                        return Err(err.context("LanceDB corruption detected in get_file_hashes"));
+                    }
+                    return Err(err.context("get_file_hashes query failed"));
+                }
+            };
 
             use futures::TryStreamExt;
-            let batches: Vec<RecordBatch> = results.try_collect().await?;
+            let batches: Vec<RecordBatch> = match results.try_collect().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let err = anyhow::anyhow!("{}", e);
+                    if is_corruption_error(&err) {
+                        return Err(err.context("LanceDB corruption detected in get_file_hashes (collect)"));
+                    }
+                    return Err(err.context("get_file_hashes collect failed"));
+                }
+            };
 
             let mut batch_rows = 0;
             for batch in &batches {

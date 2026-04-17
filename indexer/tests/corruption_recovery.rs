@@ -696,3 +696,31 @@ async fn test_get_config_returns_none_on_missing_key() {
     let missing = storage.get_config("nonexistent_key").await.expect("get missing config");
     assert_eq!(missing, None, "missing key should return None");
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests for new Arrow RecordBatch corruption patterns
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_corruption_error_detects_recordbatch_mismatch() {
+    use opencode_indexer::storage::is_corruption_error;
+
+    let err = anyhow::anyhow!("lance error: LanceError(Arrow): Invalid argument error: Attempt to merge two RecordBatch with different sizes: 20 != 19");
+    assert!(is_corruption_error(&err), "should detect RecordBatch size mismatch");
+}
+
+#[test]
+fn test_is_corruption_error_detects_merge_invalid_argument() {
+    use opencode_indexer::storage::is_corruption_error;
+
+    let err = anyhow::anyhow!("Execution error: invalid argument error: failed to merge batch data");
+    assert!(is_corruption_error(&err), "should detect merge invalid argument");
+}
+
+#[test]
+fn test_is_corruption_error_detects_lance_arrow_invalid_argument() {
+    use opencode_indexer::storage::is_corruption_error;
+
+    let err = anyhow::anyhow!("LanceError(Arrow): Invalid argument error: column type mismatch");
+    assert!(is_corruption_error(&err), "should detect LanceError Arrow invalid argument");
+}
