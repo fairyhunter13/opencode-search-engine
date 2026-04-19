@@ -23,10 +23,14 @@ async fn set_config(db: &Path, key: &str, value: &str) -> Result<()> {
     let table = if names.contains(&"config".to_string()) {
         db.open_table("config").execute().await?
     } else {
-        db.create_empty_table("config", schema().into()).execute().await?
+        db.create_empty_table("config", schema().into())
+            .execute()
+            .await?
     };
 
-    let _ = table.delete(&format!("key = '{}'", key.replace("'", "''"))).await;
+    let _ = table
+        .delete(&format!("key = '{}'", key.replace("'", "''")))
+        .await;
 
     let mut keys = StringBuilder::new();
     let mut values = StringBuilder::new();
@@ -34,10 +38,13 @@ async fn set_config(db: &Path, key: &str, value: &str) -> Result<()> {
     values.append_value(value);
 
     let schema = std::sync::Arc::new(schema());
-    let batch = RecordBatch::try_new(schema.clone(), vec![
-        std::sync::Arc::new(keys.finish()),
-        std::sync::Arc::new(values.finish()),
-    ])?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(keys.finish()),
+            std::sync::Arc::new(values.finish()),
+        ],
+    )?;
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     table.add(reader).execute().await?;
     Ok(())
@@ -203,8 +210,11 @@ async fn daemon_status_self_heals_stuck_progress() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(result["indexingInProgress"], serde_json::Value::Bool(false));
-    assert!(result["indexingPhase"].is_null());
+    assert_eq!(
+        result["result"]["indexingInProgress"],
+        serde_json::Value::Bool(false)
+    );
+    assert!(result["result"]["indexingPhase"].is_null());
 
     let _ = child.kill().await;
     Ok(())

@@ -975,6 +975,10 @@ fn should_invalidate_links_cache(path: &Path) -> bool {
         if path_str.contains("/node_modules/") && path_str.contains("@") {
             return true;
         }
+        // Repository collection directories (common patterns for multi-repo workspaces)
+        if path_str.contains("/repositories/") || path_str.contains("/repositories-ubuntu/") {
+            return true;
+        }
     }
     false
 }
@@ -1003,6 +1007,35 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
         }
         Err(_) => {
             tracing::debug!("link cache contended on read, will try file");
+        }
+    }
+
+    // TTL check: invalidate the file cache if it is older than the configured threshold.
+    // Default: 1 hour. Override via OPENCODE_INDEXER_LINKS_CACHE_TTL_SECS env var.
+    // This catches stale caches where new symlinks were added after the last save.
+    let ttl_secs: u64 = std::env::var("OPENCODE_INDEXER_LINKS_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
+    let cache_path = links_cache_path(&root_path);
+    if let Ok(meta) = std::fs::metadata(&cache_path) {
+        if let Ok(modified) = meta.modified() {
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            if age.as_secs() > ttl_secs {
+                tracing::info!(
+                    "links cache TTL expired ({}/{}s) for {}, invalidating",
+                    age.as_secs(),
+                    ttl_secs,
+                    root_path.display()
+                );
+                let _ = std::fs::remove_file(&cache_path);
+                // Also evict from in-memory cache so we don't serve the stale copy
+                if let Ok(mut cache) = link_cache().try_write() {
+                    cache.remove(&root_path);
+                }
+            }
         }
     }
 
@@ -1346,10 +1379,32 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
         root.display()
     );
 
+    // Register this db path as actively indexing so status_impl won't self-heal it away.
+    let key = storage_path.to_string_lossy().to_string();
+    active_indexes().lock().await.insert(key.clone());
+    struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let k = self.0.clone();
+            tokio::spawn(async move {
+                active_indexes().lock().await.remove(&k);
+            });
+        }
+    }
+    let _guard = Guard(key);
+
     // Open fresh storage (will create new .lancedb)
     let storage = storage::Storage::open(&storage_path, dims).await?;
     storage.set_tier(tier).await?;
     storage.set_dimensions(dims).await?;
+    storage.set_indexing_in_progress(true).await?;
+    storage
+        .set_indexing_start_time(&chrono::Utc::now().to_rfc3339())
+        .await?;
+    storage.set_indexing_phase("embedding").await?;
+    storage
+        .set_phase_progress("embedding", 0, discovery.files.len() as i64)
+        .await?;
 
     // Run indexing (simplified - just index all files)
     let mut client = model_client::pooled().await?;
@@ -1359,6 +1414,8 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
     let storage_arc = Arc::new(storage);
     let write_queue = crate::storage::WriteQueue::new(storage_arc.clone(), 32);
 
+    let mut done = 0i64;
+    let total = discovery.files.len() as i64;
     for file in &discovery.files {
         let file_path = root.join(file);
         if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
@@ -1389,10 +1446,17 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
                 tracing::warn!("auto-recovery: failed to index {}: {}", file.display(), e);
             }
         }
+        done += 1;
+        if done % 10 == 0 || done == total {
+            let _ = storage_arc
+                .set_phase_progress("embedding", done, total)
+                .await;
+        }
     }
 
     // Wait for all writes to complete
     let _ = write_queue.shutdown().await;
+    let _ = storage_arc.clear_indexing_progress().await;
 
     // Set metadata after indexing completes (duration, files, timestamps)
     let elapsed = started.elapsed();
@@ -2884,7 +2948,7 @@ async fn status_impl(root: Option<&str>, db: Option<&str>, dims: u32) -> Result<
 
     Ok(serde_json::json!({
         "exists": true,
-        "indexed": files > 0,
+        "indexed": files > 0 || chunks > 0,
         "files": files,
         "chunks": chunks,
         "tier": tier,
@@ -3112,9 +3176,11 @@ async fn health_impl(
                     if let Ok(s) = cached_storage(&link_path, dims).await {
                         let files = s.get_indexed_files().await.unwrap_or_default().len();
                         let chunks = s.count_chunks().await.unwrap_or(0);
-                        entry["indexed"] = serde_json::json!(true);
+                        entry["indexed"] = serde_json::json!(files > 0 || chunks > 0);
                         entry["files"] = serde_json::json!(files);
                         entry["chunks"] = serde_json::json!(chunks);
+                    } else {
+                        entry["indexed"] = serde_json::json!(false);
                     }
                 } else {
                     entry["indexed"] = serde_json::json!(false);
@@ -3266,6 +3332,19 @@ async fn startup_check_impl(
                         .clone()
                         .map(PathBuf::from)
                         .unwrap_or_else(|| storage::storage_path(&PathBuf::from(&root_str)));
+                    // Register as active to prevent status self-heal from clearing progress
+                    let active_key = db_path.to_string_lossy().to_string();
+                    active_indexes().lock().await.insert(active_key.clone());
+                    struct StartupGuard(String);
+                    impl Drop for StartupGuard {
+                        fn drop(&mut self) {
+                            let k = self.0.clone();
+                            tokio::spawn(async move {
+                                active_indexes().lock().await.remove(&k);
+                            });
+                        }
+                    }
+                    let _guard = StartupGuard(active_key);
                     tracing::info!(
                         "startup_check: starting background rebuild for {}",
                         root_str
@@ -3387,6 +3466,19 @@ async fn startup_check_impl(
 
         tokio::spawn(async move {
             // First run full index
+            // Register as active to prevent status self-heal from clearing progress
+            let active_key = db_path_clone.to_string_lossy().to_string();
+            active_indexes().lock().await.insert(active_key.clone());
+            struct StartupGuard2(String);
+            impl Drop for StartupGuard2 {
+                fn drop(&mut self) {
+                    let k = self.0.clone();
+                    tokio::spawn(async move {
+                        active_indexes().lock().await.remove(&k);
+                    });
+                }
+            }
+            let _guard = StartupGuard2(active_key);
             tracing::info!(
                 "startup_check: starting background rebuild for {}",
                 root_str
@@ -4047,39 +4139,208 @@ fn watcher_start_internal<'a>(
             let tier_for_links = tier.to_string();
             let state_for_links = state.clone();
             tokio::spawn(async move {
-                // Wait for indexing to complete (2s init + indexing time + buffer)
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                // Collect (repo, db) pairs; only for projects whose index exists and is non-empty
-                let pairs: Vec<(String, String)> = tokio::task::spawn_blocking({
-                    let root = root_for_links.clone();
-                    move || {
-                        cached_discover_links(&root)
-                            .into_iter()
-                            .filter(|l| l.db.join("chunks.lance").exists())
-                            .map(|l| {
-                                (
-                                    l.repo.to_string_lossy().to_string(),
-                                    l.db.to_string_lossy().to_string(),
-                                )
-                            })
-                            .collect()
+                // Retry up to 5 times with increasing delays to handle slow indexing.
+                // Delays: 10s, 40s, 70s, 100s, 130s (total wait up to ~5.8 minutes).
+                // Tracks already-started repos to avoid duplicate watcher starts.
+                let mut already_watching: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for attempt in 0u64..5 {
+                    let delay = Duration::from_secs(10 + attempt * 30);
+                    tokio::time::sleep(delay).await;
+
+                    // Discover all linked repos (regardless of index readiness) to track total.
+                    // Also filter the ready ones for immediate watcher start.
+                    let already_watching_snap = already_watching.clone();
+                    let (all_repos, pairs): (Vec<String>, Vec<(String, String)>) =
+                        tokio::task::spawn_blocking({
+                            let root = root_for_links.clone();
+                            move || {
+                                let links = cached_discover_links(&root);
+                                let all_repos: Vec<String> = links
+                                    .iter()
+                                    .map(|l| l.repo.to_string_lossy().to_string())
+                                    .collect();
+                                let pairs: Vec<(String, String)> = links
+                                    .into_iter()
+                                    .filter(|l| l.db.join("chunks.lance").exists())
+                                    .filter(|l| {
+                                        !already_watching_snap
+                                            .contains(&l.repo.to_string_lossy().to_string())
+                                    })
+                                    .map(|l| {
+                                        (
+                                            l.repo.to_string_lossy().to_string(),
+                                            l.db.to_string_lossy().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (all_repos, pairs)
+                            }
+                        })
+                        .await
+                        .unwrap_or_default();
+
+                    for (repo, db) in pairs {
+                        already_watching.insert(repo.clone());
+                        let result = dispatch_unified(
+                            state_for_links.clone(),
+                            "watcher_start".to_string(),
+                            serde_json::json!({ "root": repo, "db": db, "tier": tier_for_links }),
+                        )
+                        .await;
+                        if result["started"].as_bool().unwrap_or(false) {
+                            tracing::info!(
+                                "started watcher for linked project (attempt {}): {}",
+                                attempt + 1,
+                                db
+                            );
+                        } else if result["message"].as_str() == Some("already_watching") {
+                            tracing::debug!("watcher already running for linked project: {}", db);
+                        } else if result["success"].as_bool() == Some(false) {
+                            tracing::debug!(
+                                "watcher_start for linked project {}: {:?}",
+                                db,
+                                result
+                            );
+                        }
                     }
-                })
-                .await
-                .unwrap_or_default();
-                for (repo, db) in pairs {
-                    let result = dispatch_unified(
-                        state_for_links.clone(),
-                        "watcher_start".to_string(),
-                        serde_json::json!({ "root": repo, "db": db, "tier": tier_for_links }),
-                    )
-                    .await;
-                    if result["started"].as_bool().unwrap_or(false) {
-                        tracing::info!("started watcher for linked project: {}", db);
-                    } else if result["message"].as_str() == Some("already_watching") {
-                        tracing::debug!("watcher already running for linked project: {}", db);
-                    } else if result["success"].as_bool() == Some(false) {
-                        tracing::debug!("watcher_start for linked project {}: {:?}", db, result);
+
+                    // Only break early when every discovered link has had a watcher start
+                    // dispatched. If some repos have no index yet, keep retrying so we
+                    // pick them up once their indexing completes.
+                    if all_repos.iter().all(|r| already_watching.contains(r)) {
+                        tracing::debug!(
+                            "link cascade: all {} linked projects have watchers, stopping retries",
+                            all_repos.len()
+                        );
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Periodic check task: re-discover linked projects every 60 seconds while the
+        // watcher is active. This handles the case where a new symlink or submodule is
+        // added after the initial cascade, or where a link's index becomes ready long
+        // after startup.
+        if std::env::var("OPENCODE_INDEXER_DISABLE_LINK_CASCADE").as_deref() != Ok("1") {
+            let root_for_periodic = root.to_string();
+            let tier_for_periodic = tier.to_string();
+            let state_for_periodic = state.clone();
+            let dims_for_periodic = dimensions;
+            // Subscribe to the per-watcher shutdown channel so the task exits when the
+            // watcher is stopped.
+            let mut periodic_shutdown_rx = {
+                state
+                    .lock()
+                    .await
+                    .watchers
+                    .get(&root.to_string())
+                    .map(|w| w.shutdown_tx.subscribe())
+            };
+            tokio::spawn(async move {
+                let interval = Duration::from_secs(
+                    std::env::var("OPENCODE_INDEXER_LINK_POLL_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(60),
+                );
+                // Track repos we have already tried to start watchers for, so we don't
+                // spam on every tick.
+                let mut known_repos: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                loop {
+                    // Sleep or exit on shutdown
+                    if let Some(ref mut rx) = periodic_shutdown_rx {
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {}
+                            _ = rx.changed() => {
+                                if *rx.borrow() {
+                                    tracing::debug!(
+                                        "link periodic check: watcher shutdown, exiting"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(interval).await;
+                    }
+
+                    // Re-discover links to detect newly added symlinks/submodules
+                    let known_snap = known_repos.clone();
+                    let root_snap = root_for_periodic.clone();
+                    let tier_snap = tier_for_periodic.clone();
+                    let (new_unindexed, new_indexed): (Vec<_>, Vec<(String, String)>) =
+                        tokio::task::spawn_blocking(move || {
+                            let links = cached_discover_links(&root_snap);
+                            let new_unindexed: Vec<Link> = links
+                                .iter()
+                                .filter(|l| {
+                                    !known_snap
+                                        .contains(&l.repo.to_string_lossy().to_string())
+                                        && !l.db.join("chunks.lance").exists()
+                                })
+                                .cloned()
+                                .collect();
+                            let new_indexed: Vec<(String, String)> = links
+                                .into_iter()
+                                .filter(|l| {
+                                    !known_snap
+                                        .contains(&l.repo.to_string_lossy().to_string())
+                                        && l.db.join("chunks.lance").exists()
+                                })
+                                .map(|l| {
+                                    (
+                                        l.repo.to_string_lossy().to_string(),
+                                        l.db.to_string_lossy().to_string(),
+                                    )
+                                })
+                                .collect();
+                            (new_unindexed, new_indexed)
+                        })
+                        .await
+                        .unwrap_or_default();
+
+                    // Trigger indexing for newly discovered unindexed links
+                    for link in new_unindexed {
+                        let repo_str = link.repo.to_string_lossy().to_string();
+                        tracing::info!(
+                            "link periodic check: new unindexed linked project discovered: {}",
+                            repo_str
+                        );
+                        known_repos.insert(repo_str);
+                        ensure_link_index(
+                            link,
+                            &tier_snap,
+                            dims_for_periodic,
+                            &root_for_periodic,
+                        )
+                        .await;
+                    }
+
+                    // Start watchers for newly indexed links
+                    for (repo, db) in new_indexed {
+                        tracing::info!(
+                            "link periodic check: starting watcher for newly indexed link: {}",
+                            db
+                        );
+                        known_repos.insert(repo.clone());
+                        let result = dispatch_unified(
+                            state_for_periodic.clone(),
+                            "watcher_start".to_string(),
+                            serde_json::json!({ "root": repo, "db": db, "tier": tier_snap }),
+                        )
+                        .await;
+                        if result["started"].as_bool().unwrap_or(false) {
+                            tracing::info!("link periodic check: watcher started for: {}", db);
+                        } else if result["success"].as_bool() == Some(false) {
+                            tracing::debug!(
+                                "link periodic check: watcher_start failed for {}: {:?}",
+                                db,
+                                result
+                            );
+                        }
                     }
                 }
             });
