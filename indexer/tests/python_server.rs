@@ -47,7 +47,11 @@ impl PythonServer {
             .is_ok()
         {
             tracing::info!("reusing existing HTTP embedder at port {port}");
-            return Ok(Self { home, port, child: None });
+            return Ok(Self {
+                home,
+                port,
+                child: None,
+            });
         }
 
         // 2. Spawn a new HTTP server
@@ -87,7 +91,11 @@ impl PythonServer {
                 .await
                 .is_ok()
             {
-                return Ok(Self { home, port, child: Some(child) });
+                return Ok(Self {
+                    home,
+                    port,
+                    child: Some(child),
+                });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
