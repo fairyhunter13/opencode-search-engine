@@ -1346,10 +1346,32 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
         root.display()
     );
 
+    // Register this db path as actively indexing so status_impl won't self-heal it away.
+    let key = storage_path.to_string_lossy().to_string();
+    active_indexes().lock().await.insert(key.clone());
+    struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let k = self.0.clone();
+            tokio::spawn(async move {
+                active_indexes().lock().await.remove(&k);
+            });
+        }
+    }
+    let _guard = Guard(key);
+
     // Open fresh storage (will create new .lancedb)
     let storage = storage::Storage::open(&storage_path, dims).await?;
     storage.set_tier(tier).await?;
     storage.set_dimensions(dims).await?;
+    storage.set_indexing_in_progress(true).await?;
+    storage
+        .set_indexing_start_time(&chrono::Utc::now().to_rfc3339())
+        .await?;
+    storage.set_indexing_phase("embedding").await?;
+    storage
+        .set_phase_progress("embedding", 0, discovery.files.len() as i64)
+        .await?;
 
     // Run indexing (simplified - just index all files)
     let mut client = model_client::pooled().await?;
@@ -1359,6 +1381,8 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
     let storage_arc = Arc::new(storage);
     let write_queue = crate::storage::WriteQueue::new(storage_arc.clone(), 32);
 
+    let mut done = 0i64;
+    let total = discovery.files.len() as i64;
     for file in &discovery.files {
         let file_path = root.join(file);
         if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
@@ -1389,10 +1413,17 @@ async fn run_index_background(root: &str, tier: &str, dims: u32) -> anyhow::Resu
                 tracing::warn!("auto-recovery: failed to index {}: {}", file.display(), e);
             }
         }
+        done += 1;
+        if done % 10 == 0 || done == total {
+            let _ = storage_arc
+                .set_phase_progress("embedding", done, total)
+                .await;
+        }
     }
 
     // Wait for all writes to complete
     let _ = write_queue.shutdown().await;
+    let _ = storage_arc.clear_indexing_progress().await;
 
     // Set metadata after indexing completes (duration, files, timestamps)
     let elapsed = started.elapsed();
@@ -3266,6 +3297,19 @@ async fn startup_check_impl(
                         .clone()
                         .map(PathBuf::from)
                         .unwrap_or_else(|| storage::storage_path(&PathBuf::from(&root_str)));
+                    // Register as active to prevent status self-heal from clearing progress
+                    let active_key = db_path.to_string_lossy().to_string();
+                    active_indexes().lock().await.insert(active_key.clone());
+                    struct StartupGuard(String);
+                    impl Drop for StartupGuard {
+                        fn drop(&mut self) {
+                            let k = self.0.clone();
+                            tokio::spawn(async move {
+                                active_indexes().lock().await.remove(&k);
+                            });
+                        }
+                    }
+                    let _guard = StartupGuard(active_key);
                     tracing::info!(
                         "startup_check: starting background rebuild for {}",
                         root_str
@@ -3387,6 +3431,19 @@ async fn startup_check_impl(
 
         tokio::spawn(async move {
             // First run full index
+            // Register as active to prevent status self-heal from clearing progress
+            let active_key = db_path_clone.to_string_lossy().to_string();
+            active_indexes().lock().await.insert(active_key.clone());
+            struct StartupGuard2(String);
+            impl Drop for StartupGuard2 {
+                fn drop(&mut self) {
+                    let k = self.0.clone();
+                    tokio::spawn(async move {
+                        active_indexes().lock().await.remove(&k);
+                    });
+                }
+            }
+            let _guard = StartupGuard2(active_key);
             tracing::info!(
                 "startup_check: starting background rebuild for {}",
                 root_str
