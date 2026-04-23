@@ -9,10 +9,35 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::config;
+
+// Cache configuration
+const MAX_CACHE_SIZE: usize = 1000;
+const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Generic cache entry with TTL support
+#[derive(Clone)]
+struct CacheEntry<T> {
+    value: T,
+    created: Instant,
+}
+
+impl<T: Clone> CacheEntry<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            created: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.created.elapsed() > CACHE_TTL
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LinkMount {
@@ -202,6 +227,7 @@ pub struct DiscoveryResult {
 }
 
 /// Cached discovery result, invalidated by filesystem notifications.
+#[derive(Clone)]
 struct CachedDiscoveryResult {
     result: DiscoveryResult,
 }
@@ -224,17 +250,36 @@ fn git_root(dir: &Path) -> Option<PathBuf> {
 }
 
 thread_local! {
-    static GIT_ROOT_CACHE: RefCell<HashMap<PathBuf, Option<PathBuf>>> = RefCell::new(HashMap::new());
+    static GIT_ROOT_CACHE: RefCell<HashMap<PathBuf, CacheEntry<Option<PathBuf>>>> = RefCell::new(HashMap::new());
 }
 
 fn cached_git_root(path: &Path) -> Option<PathBuf> {
     GIT_ROOT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(result) = cache.get(path) {
-            return result.clone();
+
+        // Check if entry exists and is not expired
+        if let Some(entry) = cache.get(path) {
+            if !entry.is_expired() {
+                return entry.value.clone();
+            }
+            // Entry expired, remove it
+            cache.remove(path);
         }
+
+        // Evict old entries if cache is full
+        if cache.len() >= MAX_CACHE_SIZE {
+            let keys_to_remove: Vec<PathBuf> = cache
+                .iter()
+                .take(MAX_CACHE_SIZE / 2)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys_to_remove {
+                cache.remove(&key);
+            }
+        }
+
         let result = git_root(path);
-        cache.insert(path.to_path_buf(), result.clone());
+        cache.insert(path.to_path_buf(), CacheEntry::new(result.clone()));
         result
     })
 }
@@ -370,8 +415,8 @@ fn is_ignored_extension_path(path: &Path) -> bool {
     is_ignored_extension(&ext.to_lowercase())
 }
 
-fn discovery_cache() -> &'static RwLock<HashMap<PathBuf, CachedDiscoveryResult>> {
-    static CACHE: OnceLock<RwLock<HashMap<PathBuf, CachedDiscoveryResult>>> = OnceLock::new();
+fn discovery_cache() -> &'static RwLock<HashMap<PathBuf, CacheEntry<CachedDiscoveryResult>>> {
+    static CACHE: OnceLock<RwLock<HashMap<PathBuf, CacheEntry<CachedDiscoveryResult>>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -396,10 +441,23 @@ pub fn discover_files_with_config(
 
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-    // Check cache first (no TTL — invalidated by filesystem notifications)
+    // Check cache first and validate TTL
+    if let Ok(mut write) = cache.write() {
+        if let Some(entry) = write.get(&key) {
+            if !entry.is_expired() {
+                return Ok(entry.value.result.clone());
+            }
+            // Entry expired, remove it
+            write.remove(&key);
+        }
+    }
+
+    // Read lock for final check before expensive operation
     if let Ok(read) = cache.read() {
-        if let Some(cached) = read.get(&key) {
-            return Ok(cached.result.clone());
+        if let Some(entry) = read.get(&key) {
+            if !entry.is_expired() {
+                return Ok(entry.value.result.clone());
+            }
         }
     }
 
@@ -596,13 +654,25 @@ pub fn discover_files_with_config(
         symlink_dirs,
     };
 
-    // Store in cache
+    // Store in cache with eviction if needed
     if let Ok(mut write) = cache.write() {
+        // Evict old entries if cache is full
+        if write.len() >= MAX_CACHE_SIZE {
+            let keys_to_remove: Vec<PathBuf> = write
+                .iter()
+                .take(MAX_CACHE_SIZE / 2)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in keys_to_remove {
+                write.remove(&k);
+            }
+        }
+
         write.insert(
             key,
-            CachedDiscoveryResult {
+            CacheEntry::new(CachedDiscoveryResult {
                 result: result.clone(),
-            },
+            }),
         );
     }
 
@@ -728,28 +798,54 @@ pub fn relative_path_with_symlinks(
 
 
 /// Global cache for submodule discovery results keyed by project root.
-fn submodule_cache() -> &'static RwLock<HashMap<PathBuf, Vec<(PathBuf, String)>>> {
-    static CACHE: OnceLock<RwLock<HashMap<PathBuf, Vec<(PathBuf, String)>>>> = OnceLock::new();
+fn submodule_cache() -> &'static RwLock<HashMap<PathBuf, CacheEntry<Vec<(PathBuf, String)>>>> {
+    static CACHE: OnceLock<RwLock<HashMap<PathBuf, CacheEntry<Vec<(PathBuf, String)>>>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Discover git submodules in the given project root.
 ///
 /// Runs `git submodule status --recursive` and parses the output.
-/// Returns `(absolute_path, name)` pairs. Results are cached globally.
+/// Returns `(absolute_path, name)` pairs. Results are cached globally with TTL.
 pub fn discover_submodules(root: &Path) -> Vec<(PathBuf, String)> {
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
+    // Check cache and validate TTL
+    if let Ok(mut write) = submodule_cache().write() {
+        if let Some(entry) = write.get(&key) {
+            if !entry.is_expired() {
+                return entry.value.clone();
+            }
+            // Entry expired, remove it
+            write.remove(&key);
+        }
+    }
+
+    // Read lock for final check
     if let Ok(read) = submodule_cache().read() {
-        if let Some(cached) = read.get(&key) {
-            return cached.clone();
+        if let Some(entry) = read.get(&key) {
+            if !entry.is_expired() {
+                return entry.value.clone();
+            }
         }
     }
 
     let result = run_discover_submodules(root);
 
     if let Ok(mut write) = submodule_cache().write() {
-        write.insert(key, result.clone());
+        // Evict old entries if cache is full
+        if write.len() >= MAX_CACHE_SIZE {
+            let keys_to_remove: Vec<PathBuf> = write
+                .iter()
+                .take(MAX_CACHE_SIZE / 2)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in keys_to_remove {
+                write.remove(&k);
+            }
+        }
+
+        write.insert(key, CacheEntry::new(result.clone()));
     }
 
     result

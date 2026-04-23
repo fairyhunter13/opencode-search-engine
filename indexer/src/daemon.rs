@@ -250,19 +250,11 @@ struct WatcherState {
 
 impl WatcherState {
     /// Drain the WriteQueue, waiting for all pending writes to complete.
-    /// Returns the write stats snapshot if successful.
+    /// Returns the write stats snapshot.
     async fn drain_write_queue(&mut self) -> Option<crate::storage::WriteQueueStatsSnapshot> {
         if let Some(wq) = self.write_queue.take() {
-            // Try to get exclusive ownership. If other refs exist, we can't drain.
-            match Arc::try_unwrap(wq) {
-                Ok(queue) => Some(queue.shutdown().await),
-                Err(arc) => {
-                    // Other references exist, can't drain exclusively
-                    tracing::warn!("WriteQueue has other references, cannot drain exclusively");
-                    self.write_queue = Some(arc); // Put it back
-                    None
-                }
-            }
+            // Use shutdown_shared which handles Arc properly without data loss
+            Some(wq.shutdown_shared().await)
         } else {
             None
         }
@@ -1216,6 +1208,25 @@ async fn ensure_link_index(link: Link, tier: &str, dims: u32, parent_root: &str)
     .await
     .unwrap_or(2);
 
+    // Check if DB already has chunks - skip if already indexed
+    let needs_index = if !tokio::fs::try_exists(&link.db).await.unwrap_or(false) {
+        true
+    } else {
+        match cached_storage(&link.db, dims).await {
+            Ok(s) => s.count_chunks().await.unwrap_or(0) == 0,
+            Err(_) => true,
+        }
+    };
+
+    if !needs_index {
+        tracing::info!(
+            "skipping already-indexed linked project: {} (has chunks)",
+            link.repo.display()
+        );
+        link_index_inflight().lock().await.remove(&link.db);
+        return;
+    }
+
     tracing::info!(
         "auto-indexing linked project in background: {} (weight={}/8)",
         link.repo.display(),
@@ -1230,50 +1241,39 @@ async fn ensure_link_index(link: Link, tier: &str, dims: u32, parent_root: &str)
             return;
         };
 
-        let needs_index = if !tokio::fs::try_exists(&link.db).await.unwrap_or(false) {
-            true
-        } else {
-            match cached_storage(&link.db, dims).await {
-                Ok(s) => s.count_chunks().await.unwrap_or(0) == 0,
-                Err(_) => true,
-            }
-        };
+        // Load parent project config to get linked project's exclude/include patterns
+        let parent_path = std::path::PathBuf::from(&parent_root_owned);
+        let parent_project = crate::config::load(&parent_path);
 
-        if needs_index {
-            // Load parent project config to get linked project's exclude/include patterns
-            let parent_path = std::path::PathBuf::from(&parent_root_owned);
-            let parent_project = crate::config::load(&parent_path);
+        // Load linked project's own config (if it has .opencode-index.yaml)
+        let linked_project = crate::config::load(&link.repo);
 
-            // Load linked project's own config (if it has .opencode-index.yaml)
-            let linked_project = crate::config::load(&link.repo);
+        // Get effective config: merge parent's linked[name] with linked project's own config
+        let effective_cfg =
+            crate::config::effective(&parent_project, Some(&link.name), Some(&linked_project));
 
-            // Get effective config: merge parent's linked[name] with linked project's own config
-            let effective_cfg =
-                crate::config::effective(&parent_project, Some(&link.name), Some(&linked_project));
-
-            let root = link.repo.to_string_lossy().to_string();
-            tracing::info!(
-                "linked index start: {} (weight={}/8, exclude: {:?}, include: {:?})",
-                root,
-                weight,
-                effective_cfg.exclude,
-                effective_cfg.include
-            );
-            let r = run_index_impl(
-                &root,
-                None,
-                &tier,
-                dims,
-                false,
-                &effective_cfg.exclude,
-                &effective_cfg.include,
-            )
-            .await;
-            if let Err(e) = r {
-                tracing::warn!("linked index failed: {}: {e}", root);
-            }
-            tracing::info!("linked index done: {} (weight={}/8)", root, weight);
+        let root = link.repo.to_string_lossy().to_string();
+        tracing::info!(
+            "linked index start: {} (weight={}/8, exclude: {:?}, include: {:?})",
+            root,
+            weight,
+            effective_cfg.exclude,
+            effective_cfg.include
+        );
+        let r = run_index_impl(
+            &root,
+            None,
+            &tier,
+            dims,
+            false,
+            &effective_cfg.exclude,
+            &effective_cfg.include,
+        )
+        .await;
+        if let Err(e) = r {
+            tracing::warn!("linked index failed: {}: {e}", root);
         }
+        tracing::info!("linked index done: {} (weight={}/8)", root, weight);
 
         link_index_inflight().lock().await.remove(&link.db);
     });
@@ -4713,22 +4713,45 @@ async fn dispatch_unified(
         let root = params["root"].as_str().unwrap_or(".");
         let db = params["db"].as_str();
         let key = canonicalize_project_key(root).await;
-        let s = state.lock().await;
-        return if let Some(watcher) = s.watchers.get(&key) {
-            let dropped = watcher.dropped_stats.lock().await;
-            let uptime = watcher.started_at.elapsed().as_secs();
-            let pending_count = watcher.pending.lock().await.len();
+
+        // Clone necessary data under outer lock, then drop it before accessing inner locks
+        let watcher_data = {
+            let s = state.lock().await;
+            s.watchers.get(&key).map(|w| {
+                (
+                    w.dropped_stats.clone(),  // Arc<Mutex<_>> clone
+                    w.pending.clone(),        // Arc<Mutex<_>> clone
+                    w.started_at,
+                    w.db_path.clone(),
+                    w.max_pending_files,
+                )
+            })
+        };
+        // Outer lock dropped here
+
+        return if let Some((dropped_stats, pending, started_at, db_path, max_pending_files)) = watcher_data {
+            // Now safe to acquire inner locks without holding outer lock
+            let dropped = dropped_stats.lock().await;
+            let uptime = started_at.elapsed().as_secs();
+            let pending_count = pending.lock().await.len();
+
+            // Re-acquire outer lock only for connection count
+            let connection_count = {
+                let s = state.lock().await;
+                s.tui_connections.get(&key).map(|c| c.len()).unwrap_or(0)
+            };
+
             serde_json::json!({
                 "watcherActive": true,
                 "internal": true,
                 "watcherPid": null,
                 "indexerActive": false,
                 "indexerPid": null,
-                "dbPath": watcher.db_path.to_string_lossy(),
-                "connectionCount": s.tui_connections.get(&key).map(|c| c.len()).unwrap_or(0),
+                "dbPath": db_path.to_string_lossy(),
+                "connectionCount": connection_count,
                 "metrics": {
                     "uptimeSeconds": uptime,
-                    "maxPendingFiles": watcher.max_pending_files,
+                    "maxPendingFiles": max_pending_files,
                     "currentPendingFiles": pending_count,
                     "droppedChangedFiles": dropped.changed_files_dropped,
                     "droppedDeletedFiles": dropped.deleted_files_dropped,
@@ -4736,8 +4759,10 @@ async fn dispatch_unified(
                 }
             })
         } else {
-            let conn_count = s.tui_connections.get(&key).map(|c| c.len()).unwrap_or(0);
-            drop(s);
+            let conn_count = {
+                let s = state.lock().await;
+                s.tui_connections.get(&key).map(|c| c.len()).unwrap_or(0)
+            };
             watcher_status_with_connections(root, db, conn_count)
         };
     }
@@ -5322,49 +5347,45 @@ pub async fn run(port: u16) -> Result<()> {
                 let keys: Vec<String> = { state.lock().await.watchers.keys().cloned().collect() };
 
                 for key in keys {
-                    // Drain pending paths (separate changed/deleted)
-                    let (
-                        changed,
-                        deleted,
-                        storage,
-                        write_queue,
-                        root,
-                        include_dirs,
-                        symlink_dirs,
-                        tier,
-                        dims,
-                        db_path,
-                    ) = {
-                        let mut s = state.lock().await;
-                        if let Some(w) = s.watchers.get_mut(&key) {
-                            let mut pending = w.pending.lock().await;
-                            if pending.is_empty() {
-                                continue;
-                            }
-                            // Skip if write_queue is drained
-                            let Some(wq) = w.write_queue.as_ref() else {
-                                tracing::warn!(
-                                    "write_queue drained for {}, skipping pending changes",
-                                    key
-                                );
-                                continue;
-                            };
-                            let (changed, deleted) = pending.drain();
+                    // Clone watcher data under outer lock, then drop it before accessing inner pending lock
+                    let watcher_data = {
+                        let s = state.lock().await;
+                        s.watchers.get(&key).map(|w| {
                             (
-                                changed,
-                                deleted,
-                                w.storage.clone(),      // Arc clone
-                                wq.clone(),             // Arc clone
-                                w.root.clone(),         // Arc clone (cheap)
-                                w.include_dirs.clone(), // Arc clone (cheap)
-                                w.symlink_dirs.clone(), // Arc clone (cheap)
-                                w.tier.clone(),         // Arc clone (cheap)
+                                w.pending.clone(),       // Arc<Mutex<_>> clone
+                                w.write_queue.clone(),   // Option<Arc<_>> clone
+                                w.storage.clone(),       // Arc clone
+                                w.root.clone(),          // Arc clone
+                                w.include_dirs.clone(),  // Arc clone
+                                w.symlink_dirs.clone(),  // Arc clone
+                                w.tier.clone(),          // Arc clone
                                 w.dimensions,
-                                w.db_path.clone(), // Arc clone (cheap)
+                                w.db_path.clone(),       // Arc clone
                             )
-                        } else {
+                        })
+                    };
+                    // Outer lock dropped here
+
+                    let Some((pending_mutex, write_queue_opt, storage, root, include_dirs, symlink_dirs, tier, dims, db_path)) = watcher_data else {
+                        continue;
+                    };
+
+                    // Now safe to acquire inner pending lock without holding outer lock
+                    let (changed, deleted) = {
+                        let mut pending = pending_mutex.lock().await;
+                        if pending.is_empty() {
                             continue;
                         }
+                        pending.drain()
+                    };
+
+                    // Skip if write_queue is drained
+                    let Some(write_queue) = write_queue_opt else {
+                        tracing::warn!(
+                            "write_queue drained for {}, skipping pending changes",
+                            key
+                        );
+                        continue;
                     };
 
                     let total = changed.len() + deleted.len();
@@ -5616,34 +5637,42 @@ pub async fn run(port: u16) -> Result<()> {
                     { state.lock().await.memory_watchers.keys().cloned().collect() };
 
                 for scope in scopes {
-                    // Drain pending paths
-                    let (changed, deleted, storage, write_queue, root, db_path, failed_files) = {
-                        let mut s = state.lock().await;
-                        if let Some(w) = s.memory_watchers.get_mut(&scope) {
-                            let mut pending = w.pending.lock().await;
-                            if pending.is_empty() {
-                                continue;
-                            }
-                            let Some(wq) = w.write_queue.as_ref() else {
-                                tracing::warn!(
-                                    "write_queue drained for memory watcher {}, skipping",
-                                    scope
-                                );
-                                continue;
-                            };
-                            let (changed, deleted) = pending.drain();
+                    // Clone watcher data under outer lock, then drop it before accessing inner pending lock
+                    let watcher_data = {
+                        let s = state.lock().await;
+                        s.memory_watchers.get(&scope).map(|w| {
                             (
-                                changed,
-                                deleted,
-                                w.storage.clone(),
-                                wq.clone(),
-                                w.root.clone(),
-                                w.db_path.clone(),
-                                w.failed_files.clone(),
+                                w.pending.clone(),       // Arc<Mutex<_>> clone
+                                w.write_queue.clone(),   // Option<Arc<_>> clone
+                                w.storage.clone(),       // Arc clone
+                                w.root.clone(),          // Arc clone
+                                w.db_path.clone(),       // Arc clone
+                                w.failed_files.clone(),  // Arc<Mutex<_>> clone
                             )
-                        } else {
+                        })
+                    };
+                    // Outer lock dropped here
+
+                    let Some((pending_mutex, write_queue_opt, storage, root, db_path, failed_files)) = watcher_data else {
+                        continue;
+                    };
+
+                    // Now safe to acquire inner pending lock without holding outer lock
+                    let (changed, deleted) = {
+                        let mut pending = pending_mutex.lock().await;
+                        if pending.is_empty() {
                             continue;
                         }
+                        pending.drain()
+                    };
+
+                    // Skip if write_queue is drained
+                    let Some(write_queue) = write_queue_opt else {
+                        tracing::warn!(
+                            "write_queue drained for memory watcher {}, skipping",
+                            scope
+                        );
+                        continue;
                     };
 
                     let total = changed.len() + deleted.len();

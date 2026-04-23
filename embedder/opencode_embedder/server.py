@@ -639,8 +639,26 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     def _http_app(self) -> web.Application:
-        """Build the aiohttp Application with all REST routes."""
-        app = web.Application()
+        """Build the aiohttp Application with all REST routes.
+
+        Includes timeout middleware to prevent indefinite request hangs.
+        Default timeout: 120s (configurable via OPENCODE_EMBED_REQUEST_TIMEOUT).
+        """
+        # Request timeout middleware - prevents indefinite hangs
+        timeout_secs = int(os.environ.get("OPENCODE_EMBED_REQUEST_TIMEOUT", "120"))
+
+        @web.middleware
+        async def timeout_middleware(request: web.Request, handler):
+            try:
+                return await asyncio.wait_for(handler(request), timeout=timeout_secs)
+            except asyncio.TimeoutError:
+                log.warning("request timeout after %ds: %s %s", timeout_secs, request.method, request.path)
+                return web.json_response(
+                    {"error": f"request timeout after {timeout_secs}s"},
+                    status=504
+                )
+
+        app = web.Application(middlewares=[timeout_middleware])
         app.router.add_get("/health", self._http_health)
         app.router.add_post("/shutdown", self._http_shutdown)
         app.router.add_post("/embed/passages", self._http_embed_passages)
@@ -814,7 +832,9 @@ class ModelServer:
         http_runner = web.AppRunner(self._http_app())
         await http_runner.setup()
         hp = _http_port()
-        http_site = web.TCPSite(http_runner, "127.0.0.1", hp)
+        # Limit pending connections to prevent unbounded queue growth under load.
+        # backlog=128 is a reasonable limit for a local-only service.
+        http_site = web.TCPSite(http_runner, "127.0.0.1", hp, backlog=128)
         await http_site.start()
         log.info("HTTP server listening on 127.0.0.1:%d", hp)
 
