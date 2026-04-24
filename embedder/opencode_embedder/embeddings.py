@@ -1100,10 +1100,18 @@ except Exception:
 _LOW_END = _cpus <= 4 or _ram_mb <= 8192
 _HIGH_END = _cpus >= 16 and _ram_mb >= 32768
 
+# Check for low-memory mode override
+_LOW_MEMORY_MODE = os.environ.get("OPENCODE_EMBED_LOW_MEMORY", "").strip() in ("1", "true", "yes")
+
 # Batch size configuration:
 # - CPU: batch_size=8 is optimal (better cache utilization)
 # - GPU: auto-scaled based on VRAM (GPUs excel at parallel ops)
-if _LOW_END:
+# - LOW_MEMORY: smaller batches to reduce peak memory usage
+if _LOW_MEMORY_MODE:
+    _EMBED_SUB_BATCH = 32  # Smaller batches for low-memory mode
+    _ONNX_BATCH_SIZE = 4  # Reduced ONNX batch size
+    log.info("low-memory mode: batch sizes reduced (sub=%d, onnx=%d)", _EMBED_SUB_BATCH, _ONNX_BATCH_SIZE)
+elif _LOW_END:
     _EMBED_SUB_BATCH = 64  # Texts per sub-batch
     _ONNX_BATCH_SIZE = 8  # Default, overridden by _get_onnx_batch_size()
 elif _HIGH_END:
@@ -1326,39 +1334,98 @@ def _create_io_binding(session, inputs: dict, device: str = "cuda", device_id: i
         return None
 
 
+def _embed_batch_iobinding(
+    session,
+    tokenizer,
+    texts: list[str],
+    batch_size: int,
+    device: str = "cuda",
+    device_id: int = 0,
+) -> np.ndarray | None:
+    """Embed a batch using IOBinding to keep tensors on GPU.
+    
+    Returns numpy array of embeddings (single GPU→CPU copy at end) or None if IOBinding fails.
+    """
+    try:
+        import onnxruntime as ort
+        
+        # Tokenize on CPU (fast, unavoidable)
+        encoded = tokenizer.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+        
+        # Create IOBinding for GPU tensors
+        binding = session.io_binding()
+        
+        # Bind inputs to GPU
+        input_ids_gpu = ort.OrtValue.ortvalue_from_numpy(input_ids, device, device_id)
+        attention_mask_gpu = ort.OrtValue.ortvalue_from_numpy(attention_mask, device, device_id)
+        
+        binding.bind_ortvalue_input("input_ids", input_ids_gpu)
+        binding.bind_ortvalue_input("attention_mask", attention_mask_gpu)
+        
+        # Bind output to GPU (avoids CPU allocation)
+        output_names = [o.name for o in session.get_outputs()]
+        for name in output_names:
+            binding.bind_output(name, device)
+        
+        # Run inference with IOBinding (tensors stay on GPU)
+        session.run_with_iobinding(binding)
+        
+        # Extract output (single GPU→CPU copy)
+        outputs = binding.get_outputs()
+        if not outputs:
+            return None
+            
+        # Get first output (last_hidden_state or pooled output)
+        result = outputs[0].numpy()
+        
+        # Clean up GPU tensors
+        del input_ids_gpu, attention_mask_gpu, binding, outputs
+        return result
+        
+    except Exception as e:
+        log.debug("IOBinding inference failed: %s", e)
+        return None
+
+
 def _get_onnx_batch_size() -> int:
     """Get optimal ONNX batch size based on GPU specs.
 
     Conservative scaling to avoid OOM with concurrent requests:
+    - Low-memory mode: 4 (minimal memory usage)
     - No GPU or <4GB: 8 (CPU-optimized)
     - 4-8GB VRAM: 8
     - 8-16GB VRAM: 12
     - 16-24GB VRAM: 16
     - >24GB VRAM: 16
 
-    Note: With 16 concurrent connections, total GPU memory usage can be
-    batch_size * 16 * sequence_length. Smaller batches are more reliable.
+    Note: With concurrent workers, total GPU memory usage can be
+    batch_size * workers * sequence_length. Smaller batches are more reliable.
     """
+    # Check for low-memory mode override
+    if _LOW_MEMORY_MODE:
+        return 4
+
     if not is_gpu_available():
         return 8  # CPU optimal
 
     vram_mb = _get_gpu_vram_mb()
     if vram_mb is None:
-        log.info("Could not detect GPU VRAM, using default batch_size=12")
-        return 12
+        log.info("Could not detect GPU VRAM, using default batch_size=8")
+        return 8
 
     vram_gb = vram_mb / 1024
 
-    if vram_gb < 4:
-        batch_size = 8
-    elif vram_gb < 8:
-        batch_size = 8
+    # More conservative defaults to avoid memory issues
+    if vram_gb < 8:
+        batch_size = 6  # Reduced from 8 for <8GB VRAM
     elif vram_gb < 16:
-        batch_size = 12
+        batch_size = 8  # Reduced from 12
     elif vram_gb < 24:
-        batch_size = 16
+        batch_size = 12  # Reduced from 16
     else:
-        batch_size = 16  # Cap at 16 for stability with concurrent requests
+        batch_size = 12  # Reduced cap from 16
 
     log.info("Auto-configured ONNX batch_size=%d for %.1fGB VRAM", batch_size, vram_gb)
     return batch_size
@@ -1383,10 +1450,10 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
     if not texts:
         return []
 
+    import gc
     import time
 
     t_start = time.perf_counter()
-    out: list[list[float]] = []
     embedder = _embedder(model)
     t_get_embedder = time.perf_counter()
 
@@ -1401,20 +1468,112 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
     total_chars = sum(len(t) for t in texts)
     avg_chars = total_chars // len(texts) if texts else 0
 
+    # Try IOBinding path first if GPU available and active
+    use_iobinding = is_gpu and _io_binding_confirmed
+    if use_iobinding:
+        try:
+            # Access ONNX session from FastEmbed: embedder.model.model
+            session = embedder.model.model if hasattr(embedder.model, 'model') else None
+            tokenizer = embedder.model.tokenizer if hasattr(embedder.model, 'tokenizer') else None
+            
+            if session is not None and tokenizer is not None:
+                device = _device_for_provider(provider)
+                all_items: list = []
+                t_embed_total = 0.0
+                
+                for start in range(0, len(texts), _EMBED_SUB_BATCH):
+                    batch = texts[start : start + _EMBED_SUB_BATCH]
+                    prefixed = [f"passage: {t}" for t in batch]
+                    
+                    t_embed_start = time.perf_counter()
+                    # IOBinding: tensors stay on GPU
+                    batch_result = _embed_batch_iobinding(
+                        session, tokenizer, prefixed, 
+                        get_onnx_batch_size(), device
+                    )
+                    t_embed_done = time.perf_counter()
+                    t_embed_total += t_embed_done - t_embed_start
+                    
+                    if batch_result is not None:
+                        # Pool: mean of last_hidden_state (common for BERT models)
+                        # Shape: (batch, seq_len, hidden_dim) → (batch, hidden_dim)
+                        if batch_result.ndim == 3:
+                            batch_result = np.mean(batch_result, axis=1)
+                        all_items.append(batch_result.astype(np.float32))
+                        del batch_result
+                    else:
+                        # IOBinding failed, fall back to standard path
+                        use_iobinding = False
+                        break
+                    
+                    gc.collect()
+                
+                if use_iobinding and all_items:
+                    # Success! Process the GPU results
+                    mat = np.concatenate(all_items, axis=0) if len(all_items) > 1 else all_items[0]
+                    del all_items
+                    gc.collect()
+                    
+                    if mat.ndim == 1:
+                        mat = mat.reshape(1, -1)
+                    if dimensions > 0:
+                        if mat.shape[1] > dimensions:
+                            mat = mat[:, :dimensions]
+                        elif mat.shape[1] < dimensions:
+                            tmp = np.zeros((mat.shape[0], dimensions), dtype=np.float32)
+                            tmp[:, : mat.shape[1]] = mat
+                            del mat
+                            mat = tmp
+                    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                    np.divide(mat, norms, out=mat, where=norms > 0)
+                    out = mat.tolist()
+                    del mat
+                    gc.collect()
+                    
+                    t_end = time.perf_counter()
+                    if log.isEnabledFor(logging.INFO):
+                        log.info(
+                            "embed[%s+IOBinding]: %d texts (%d avg chars), onnx=%.0fms, total=%.0fms",
+                            provider.upper(),
+                            len(texts),
+                            avg_chars,
+                            t_embed_total * 1000,
+                            (t_end - t_start) * 1000,
+                        )
+                    return out
+        except Exception as e:
+            log.debug("IOBinding path failed, falling back to standard: %s", e)
+            use_iobinding = False
+
+    # Standard path (fallback or when IOBinding unavailable)
     t_prefix = time.perf_counter()
-    # Accumulate all ONNX outputs first, then normalize in a single pass
     all_items: list = []
+    t_embed_total = 0.0
     for start in range(0, len(texts), _EMBED_SUB_BATCH):
         batch = texts[start : start + _EMBED_SUB_BATCH]
         prefixed = [f"passage: {t}" for t in batch]
         t_embed_start = time.perf_counter()
-        items = list(embedder.embed(prefixed, batch_size=get_onnx_batch_size()))
+        # Keep as generator to avoid materializing full list in memory
+        items = embedder.embed(prefixed, batch_size=get_onnx_batch_size())
+        # Convert to numpy array immediately (single copy from GPU)
+        if _HAS_NUMPY:
+            batch_arr = np.array(list(items), dtype=np.float32)
+            all_items.append(batch_arr)
+            del items, batch_arr
+        else:
+            all_items.extend(list(items))
         t_embed_done = time.perf_counter()
-        all_items.extend(items)
+        t_embed_total += t_embed_done - t_embed_start
+        # Aggressive GC after each batch to free GPU-to-CPU transfer buffers
+        gc.collect()
 
     # Single-pass vectorized normalize across the full result matrix
     if _HAS_NUMPY and all_items:
-        mat = np.asarray(all_items, dtype=np.float32)
+        # Concatenate all batches once (avoid repeated extend copies)
+        mat = np.concatenate(all_items, axis=0) if len(all_items) > 1 else all_items[0]
+        del all_items  # Free batch list immediately
+        gc.collect()
+        
         if mat.ndim == 1:
             mat = mat.reshape(1, -1)
         if dimensions > 0:
@@ -1423,14 +1582,22 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
             elif mat.shape[1] < dimensions:
                 tmp = np.zeros((mat.shape[0], dimensions), dtype=np.float32)
                 tmp[:, : mat.shape[1]] = mat
+                del mat
                 mat = tmp
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         np.divide(mat, norms, out=mat, where=norms > 0)
+        # ONLY convert to list at final output (single .tolist() call)
         out = mat.tolist()
+        del mat
     else:
+        out = []
         for item in all_items:
-            out.append(_normalize(_resize([float(x) for x in item.tolist()], dimensions)))
+            vec_list = item.tolist() if hasattr(item, 'tolist') else item
+            out.append(_normalize(_resize([float(x) for x in vec_list], dimensions)))
+    
     t_postprocess = time.perf_counter()
+    # Final GC to clean up intermediate arrays
+    gc.collect()
 
     t_end = time.perf_counter()
     if log.isEnabledFor(logging.INFO):
@@ -1439,8 +1606,8 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
             provider.upper(),
             len(texts),
             avg_chars,
-            (t_embed_done - t_embed_start) * 1000,
-            (t_postprocess - t_embed_done) * 1000,
+            t_embed_total * 1000,
+            (t_postprocess - t_embed_start) * 1000 if 't_embed_start' in locals() else 0,
             (t_end - t_start) * 1000,
         )
     return out
@@ -1499,6 +1666,7 @@ def embed_passages_f32_bytes(
     if not texts:
         return b"", dimensions, 0
 
+    import gc
     import sys
     import time
 
@@ -1515,22 +1683,109 @@ def embed_passages_f32_bytes(
     dim_out = dimensions
     t_embed_total = 0.0
 
-    # Accumulate all ONNX outputs across sub-batches, then normalize once
+    # Try IOBinding path if GPU available
+    use_iobinding = is_gpu and _io_binding_confirmed
+    if use_iobinding:
+        try:
+            session = embedder.model.model if hasattr(embedder.model, 'model') else None
+            tokenizer = embedder.model.tokenizer if hasattr(embedder.model, 'tokenizer') else None
+            
+            if session is not None and tokenizer is not None:
+                device = _device_for_provider(provider)
+                all_items: list = []
+                
+                for start in range(0, len(texts), _EMBED_SUB_BATCH):
+                    batch = texts[start : start + _EMBED_SUB_BATCH]
+                    prefixed = [f"passage: {t}" for t in batch]
+                    
+                    t_embed_start = time.perf_counter()
+                    batch_result = _embed_batch_iobinding(
+                        session, tokenizer, prefixed,
+                        get_onnx_batch_size(), device
+                    )
+                    t_embed_done = time.perf_counter()
+                    t_embed_total += t_embed_done - t_embed_start
+                    
+                    if batch_result is not None:
+                        # Pool if needed
+                        if batch_result.ndim == 3:
+                            batch_result = np.mean(batch_result, axis=1)
+                        all_items.append(batch_result.astype(np.float32))
+                        del batch_result
+                    else:
+                        use_iobinding = False
+                        break
+                    
+                    gc.collect()
+                
+                if use_iobinding and all_items:
+                    # Process on GPU, single copy to bytes
+                    mat = np.concatenate(all_items, axis=0) if len(all_items) > 1 else all_items[0]
+                    del all_items
+                    gc.collect()
+                    
+                    if mat.ndim == 1:
+                        mat = mat.reshape(1, -1)
+                    
+                    if dimensions > 0:
+                        if mat.shape[1] > dimensions:
+                            mat = mat[:, :dimensions]
+                        elif mat.shape[1] < dimensions:
+                            tmp = np.zeros((mat.shape[0], dimensions), dtype=np.float32)
+                            tmp[:, : mat.shape[1]] = mat
+                            del mat
+                            mat = tmp
+                    
+                    dim_out = int(mat.shape[1]) if mat.size else dimensions
+                    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                    np.divide(mat, norms, out=mat, where=norms > 0)
+                    mat = np.asarray(mat, dtype="<f4")
+                    out_bytes = mat.tobytes()
+                    del mat
+                    gc.collect()
+                    
+                    t_end = time.perf_counter()
+                    if log.isEnabledFor(logging.INFO):
+                        log.info(
+                            "embed_f32[%s+IOBinding]: %d texts, onnx=%.0fms, total=%.0fms",
+                            provider.upper(),
+                            len(texts),
+                            t_embed_total * 1000,
+                            (t_end - t_start) * 1000,
+                        )
+                    return out_bytes, dim_out, len(texts)
+        except Exception as e:
+            log.debug("IOBinding path failed for f32_bytes, falling back: %s", e)
+            use_iobinding = False
+
+    # Standard path (fallback)
     all_items: list = []
     for start in range(0, len(texts), _EMBED_SUB_BATCH):
         batch = texts[start : start + _EMBED_SUB_BATCH]
         prefixed = [f"passage: {t}" for t in batch]
 
         t_embed_start = time.perf_counter()
-        items = list(embedder.embed(prefixed, batch_size=get_onnx_batch_size()))
+        items = embedder.embed(prefixed, batch_size=get_onnx_batch_size())
+        # Convert to numpy immediately (single copy)
+        if _HAS_NUMPY:
+            batch_arr = np.array(list(items), dtype=np.float32)
+            all_items.append(batch_arr)
+            del items, batch_arr
+        else:
+            all_items.extend(list(items))
         t_embed_done = time.perf_counter()
         t_embed_total += t_embed_done - t_embed_start
-        all_items.extend(items)
+        # Aggressive GC after each batch
+        gc.collect()
 
     # Single-pass vectorized normalize + serialize
     t_post_start = time.perf_counter()
     if _HAS_NUMPY and all_items:
-        mat = np.asarray(all_items, dtype=np.float32)
+        # Concatenate once instead of repeated extend
+        mat = np.concatenate(all_items, axis=0) if len(all_items) > 1 else all_items[0]
+        del all_items
+        gc.collect()
+        
         if getattr(mat, "ndim", 0) == 1:
             mat = mat.reshape(1, -1)
 
@@ -1540,6 +1795,7 @@ def embed_passages_f32_bytes(
             elif mat.shape[1] < dimensions:
                 tmp = np.zeros((mat.shape[0], dimensions), dtype=np.float32)
                 tmp[:, : mat.shape[1]] = mat
+                del mat
                 mat = tmp
 
         dim_out = int(mat.shape[1]) if mat.size else dimensions
@@ -1547,13 +1803,16 @@ def embed_passages_f32_bytes(
         np.divide(mat, norms, out=mat, where=norms > 0)
 
         mat = np.asarray(mat, dtype="<f4")
+        # Convert to bytes directly, no .tolist() intermediate step
         out_bytes = mat.tobytes()
+        del mat
     elif all_items:
         import array
 
         buf = array.array("f")
         for item in all_items:
-            vec = _normalize(_resize([float(x) for x in item.tolist()], dimensions))
+            vec_list = item.tolist() if hasattr(item, 'tolist') else item
+            vec = _normalize(_resize([float(x) for x in vec_list], dimensions))
             buf.fromlist(vec)  # type: ignore[arg-type]
         if sys.byteorder != "little":
             buf.byteswap()
@@ -1563,6 +1822,8 @@ def embed_passages_f32_bytes(
         out_bytes = b""
 
     t_post_total = time.perf_counter() - t_post_start
+    # Final cleanup
+    gc.collect()
 
     t_end = time.perf_counter()
     if log.isEnabledFor(logging.INFO):

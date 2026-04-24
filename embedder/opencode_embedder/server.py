@@ -201,6 +201,7 @@ def _detect_embed_workers() -> int:
     that wait on the embed semaphore. Only `workers` ONNX sessions run at once.
 
     Can be overridden via OPENCODE_EMBED_WORKERS environment variable.
+    Low-memory mode: OPENCODE_EMBED_LOW_MEMORY=1 forces 1 worker.
     """
     # Check for manual override first
     override = os.environ.get("OPENCODE_EMBED_WORKERS", "").strip()
@@ -212,28 +213,33 @@ def _detect_embed_workers() -> int:
         except ValueError:
             pass
 
+    # Check for low-memory mode
+    low_mem = os.environ.get("OPENCODE_EMBED_LOW_MEMORY", "").strip() in ("1", "true", "yes")
+    if low_mem:
+        log.info("low-memory mode enabled (OPENCODE_EMBED_LOW_MEMORY=1)")
+        return 1
+
     # Auto-detect based on GPU availability
     if is_gpu_available():
-        # GPU mode: scale by VRAM, not CPU cores.
-        # Each concurrent ONNX session needs ~1-2GB VRAM for attention buffers.
-        # Sweet spot is 2-3 for consumer GPUs (8-24GB), 3-4 for data center (48-80GB).
+        # GPU mode: default to 1 worker to reduce memory copies
+        # High VRAM GPUs can handle parallelism internally via batch processing
+        # For memory-constrained setups, 1 worker avoids 3× memory multiplication
         from opencode_embedder.embeddings import _get_gpu_vram_mb
 
         vram_mb = _get_gpu_vram_mb()
         if vram_mb is not None:
             vram_gb = vram_mb / 1024
-            if vram_gb < 6:
-                return 1
+            # Conservative: 1 worker default, scale up only for high-VRAM GPUs
             if vram_gb < 12:
-                return 2
+                return 1  # <12GB: single worker to avoid OOM
             if vram_gb < 32:
-                return 3  # 12-32GB (RTX 3090, RX 7900 XTX, A5000)
+                return 2  # 12-32GB (RTX 3090, RX 7900 XTX, A5000)
             if vram_gb < 64:
-                return 4  # 32-64GB (A100 40GB, A6000)
-            return 6  # 64GB+ (A100 80GB, H100)
+                return 3  # 32-64GB (A100 40GB, A6000)
+            return 4  # 64GB+ (A100 80GB, H100) - capped lower than before
 
         # Fallback: no VRAM detection, conservative
-        return 2
+        return 1
 
     # CPU mode: limited by CPU cores
     if _LOW_END:
@@ -551,15 +557,12 @@ class ModelServer:
         return v
 
     async def _http_health(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         return web.json_response({"result": self._handle_health()})
 
     async def _http_shutdown(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         return web.json_response({"result": self._handle_shutdown()})
 
     async def _http_embed_passages(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_embed_passages(params)
@@ -569,7 +572,6 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     async def _http_embed_passages_f32(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_embed_passages_f32(params)
@@ -579,7 +581,6 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     async def _http_embed_query(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_embed_query(params)
@@ -589,7 +590,6 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     async def _http_embed_query_f32(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_embed_query_f32(params)
@@ -599,7 +599,6 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     async def _http_chunk(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_chunk(params)
@@ -609,7 +608,6 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     async def _http_chunk_file(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_chunk(params)
@@ -619,7 +617,6 @@ class ModelServer:
             return web.json_response({"error": str(exc)}, status=500)
 
     async def _http_chunk_and_embed(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_chunk_and_embed(params)
@@ -628,8 +625,16 @@ class ModelServer:
             log.exception("http chunk_and_embed error: %s", exc)
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def _http_chunk_and_embed_f32(self, req: web.Request) -> web.Response:
+        try:
+            params = await req.json()
+            result = await self._handle_chunk_and_embed_f32(params)
+            return web.json_response({"result": self._jsonify(result)})
+        except Exception as exc:
+            log.exception("http chunk_and_embed_f32 error: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def _http_rerank(self, req: web.Request) -> web.Response:
-        self._last_activity = time.monotonic()
         try:
             params = await req.json()
             result = await self._handle_rerank(params)
@@ -649,6 +654,7 @@ class ModelServer:
 
         @web.middleware
         async def timeout_middleware(request: web.Request, handler):
+            self._last_activity = time.monotonic()
             try:
                 return await asyncio.wait_for(handler(request), timeout=timeout_secs)
             except asyncio.TimeoutError:
@@ -668,6 +674,7 @@ class ModelServer:
         app.router.add_post("/embed/chunk", self._http_chunk)
         app.router.add_post("/embed/chunk_file", self._http_chunk_file)
         app.router.add_post("/embed/chunk_and_embed", self._http_chunk_and_embed)
+        app.router.add_post("/embed/chunk_and_embed_f32", self._http_chunk_and_embed_f32)
         app.router.add_post("/embed/rerank", self._http_rerank)
         return app
 
