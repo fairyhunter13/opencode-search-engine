@@ -189,6 +189,10 @@ pub struct Args {
     /// Idle timeout before auto-shutdown (seconds, 0=disabled, default: 600)
     #[arg(long)]
     pub idle_shutdown: Option<u64>,
+
+    /// Parent process PID to monitor (shutdown if parent dies)
+    #[arg(long)]
+    pub parent_pid: Option<i32>,
 }
 
 /// Emit a structured JSON-lines event to stdout.
@@ -258,7 +262,7 @@ pub async fn update_file_partial_pub(
 pub async fn run(args: Args) -> Result<()> {
     // Daemon mode: start HTTP server.
     if args.daemon {
-        return crate::daemon::run(args.port, args.idle_shutdown).await;
+        return crate::daemon::run(args.port, args.idle_shutdown, args.parent_pid).await;
     }
 
     let root = args.root.canonicalize().context("invalid root path")?;

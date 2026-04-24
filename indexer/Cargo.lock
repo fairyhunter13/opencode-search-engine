@@ -3920,6 +3920,7 @@ dependencies = [
  "notify",
  "num_cpus",
  "predicates",
+ "rayon",
  "regex",
  "reqwest",
  "rmp-serde",

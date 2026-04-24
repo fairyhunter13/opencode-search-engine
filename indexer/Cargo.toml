@@ -13,7 +13,14 @@ path = "src/lib.rs"
 name = "opencode-indexer"
 path = "src/main.rs"
 
+[features]
+default = ["rayon"]
+rayon = ["dep:rayon"]
+
 [dependencies]
+# Parallel iterators for SIMD batch operations
+rayon = { version = "1.10", optional = true }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

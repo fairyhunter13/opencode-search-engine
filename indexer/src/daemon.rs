@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::watcher::{self, WatchEvent};
@@ -27,14 +28,22 @@ const COMPACTION_QUEUE_SIZE: usize = 100; // Max pending compaction requests
 const WATCHER_START_RETRY_DELAYS: [u64; 3] = [100, 200, 400]; // ms, exponential backoff
 const TUI_CLEANUP_SETTLE_MS: u64 = 100; // ms wait after shutdown signal before drain
 const TUI_CLEANUP_DRAIN_TIMEOUT_SECS: u64 = 30; // drain timeout for TUI cleanup
+const PROJECT_INACTIVE_TTL: Duration = Duration::from_secs(3600); // 1 hour
+const MAX_FILE_RETRIES: u32 = 3; // Max retries for failed files in memory watchers
 
 // ---------------------------------------------------------------------------
 // Path canonicalization cache (prevents blocking I/O in async context)
 // ---------------------------------------------------------------------------
 
+/// Cached canonicalized path with LRU tracking
+struct CachedCanonicalPath {
+    path: String,
+    last_access: Instant,
+}
+
 /// Global cache for canonicalized paths to avoid blocking I/O.
-fn canonicalized_paths_cache() -> &'static RwLock<HashMap<String, String>> {
-    static CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+fn canonicalized_paths_cache() -> &'static RwLock<HashMap<String, CachedCanonicalPath>> {
+    static CACHE: OnceLock<RwLock<HashMap<String, CachedCanonicalPath>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -43,6 +52,12 @@ fn canonicalized_paths_cache() -> &'static RwLock<HashMap<String, String>> {
 fn active_indexes() -> &'static Mutex<HashSet<String>> {
     static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Parent PID to monitor (if set via CLI arg or env var).
+fn parent_pid() -> &'static std::sync::OnceLock<Option<i32>> {
+    static PARENT_PID: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    &PARENT_PID
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +104,23 @@ fn kill_process_group() {
     }
 }
 
+/// Monitor parent process and exit if it dies.
+/// Spawns a background task that polls parent PID every 5 seconds.
+async fn spawn_parent_monitor(parent_pid: i32, shutdown_tx: tokio::sync::watch::Sender<bool>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Check if parent is alive via kill(pid, 0)
+            let alive = unsafe { libc::kill(parent_pid, 0) == 0 };
+            if !alive {
+                tracing::warn!("Parent process {} died, initiating shutdown", parent_pid);
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+        }
+    });
+}
+
 #[derive(Debug, Serialize)]
 struct Response {
     id: u64,
@@ -111,6 +143,7 @@ struct QueueItem {
 struct ProjectQueue {
     queue: VecDeque<QueueItem>,
     processing: bool,
+    last_activity: Instant,
 }
 
 /// Daemon state shared across connections.
@@ -126,7 +159,7 @@ struct DaemonState {
     /// Used by the cleanup task to stop TUI-managed watchers after disconnect/crash.
     tui_projects: HashSet<String>,
     /// Per-database compaction state for smart deferred compaction.
-    compaction: HashMap<String, CompactionState>,
+    compaction: HashMap<CompactionKey, CompactionState>,
     /// Sender for the compaction worker queue. Stored here so RPC handlers can queue compaction.
     compaction_tx: Option<tokio::sync::mpsc::Sender<CompactionRequest>>,
     /// Internal watchers keyed by canonicalized project root
@@ -135,6 +168,52 @@ struct DaemonState {
     memory_watchers: HashMap<String, MemoryWatcherState>,
     /// Last activity timestamp for idle shutdown tracking
     last_activity: Arc<RwLock<Instant>>,
+}
+
+impl DaemonState {
+    /// Remove inactive projects, watchers, and compaction state that haven't been
+    /// active for PROJECT_INACTIVE_TTL (1 hour). Prevents unbounded HashMap growth.
+    fn cleanup_inactive(&mut self) {
+        let now = Instant::now();
+        let before_projects = self.projects.len();
+        let before_watchers = self.watchers.len();
+        let before_memory_watchers = self.memory_watchers.len();
+        let before_compaction = self.compaction.len();
+
+        // Remove inactive project queues (not processing and no recent activity)
+        self.projects.retain(|_key, queue| {
+            let active = now.duration_since(queue.last_activity) < PROJECT_INACTIVE_TTL;
+            let keep = active || queue.processing || !queue.queue.is_empty();
+            keep
+        });
+
+        // Remove inactive watchers (stopped or idle for TTL)
+        self.watchers.retain(|_key, watcher| {
+            now.duration_since(watcher.started_at) < PROJECT_INACTIVE_TTL
+        });
+
+        // Remove inactive memory watchers
+        self.memory_watchers.retain(|_key, watcher| {
+            now.duration_since(watcher.started_at) < PROJECT_INACTIVE_TTL
+        });
+
+        // Remove stale compaction state (using existing COMPACTION_STATE_TTL)
+        self.compaction.retain(|_key, state| {
+            now.duration_since(state.last_activity) < COMPACTION_STATE_TTL
+        });
+
+        let cleaned_projects = before_projects.saturating_sub(self.projects.len());
+        let cleaned_watchers = before_watchers.saturating_sub(self.watchers.len());
+        let cleaned_memory = before_memory_watchers.saturating_sub(self.memory_watchers.len());
+        let cleaned_compaction = before_compaction.saturating_sub(self.compaction.len());
+
+        if cleaned_projects > 0 || cleaned_watchers > 0 || cleaned_memory > 0 || cleaned_compaction > 0 {
+            tracing::info!(
+                "TTL cleanup: removed {} projects, {} watchers, {} memory watchers, {} compaction states",
+                cleaned_projects, cleaned_watchers, cleaned_memory, cleaned_compaction
+            );
+        }
+    }
 }
 
 /// Pending file changes buffer with separate changed/deleted tracking
@@ -280,7 +359,7 @@ struct MemoryWatcherState {
     /// Shutdown signal
     _shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Watcher start time (for uptime calculation)
-    _started_at: Instant,
+    started_at: Instant,
     /// Scope identifier (e.g., "global", "project:abc123:memories")
     _scope: String,
 }
@@ -291,11 +370,14 @@ struct MemoryWatcherState {
 // and compact when idle or when a threshold is reached.
 // ---------------------------------------------------------------------------
 
+/// Compaction key type (avoids string allocation).
+type CompactionKey = (PathBuf, u32);
+
 /// Request to compact a database (sent to the compaction worker queue).
 #[derive(Debug, Clone)]
 struct CompactionRequest {
-    /// Unique key for deduplication (typically db_path + dims).
-    key: String,
+    /// Unique key for deduplication (db_path, dims tuple - no allocation).
+    key: CompactionKey,
     /// Database path.
     db_path: PathBuf,
     /// Dimensions for Storage::open.
@@ -459,7 +541,7 @@ async fn compaction_worker(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // Track in-flight compactions to deduplicate
-    let mut in_flight: HashSet<String> = HashSet::new();
+    let mut in_flight: HashSet<CompactionKey> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -509,7 +591,7 @@ async fn compaction_worker(
                 if in_flight.contains(&req.key) {
                     tracing::trace!(
                         "skipping duplicate compaction request for {} (source: {})",
-                        req.key, req.source
+                        req.db_path.display(), req.source
                     );
                     continue;
                 }
@@ -576,7 +658,7 @@ fn queue_compaction(
     dims: u32,
     source: &'static str,
 ) {
-    let key = format!("{}:{}", db_path.display(), dims);
+    let key = (db_path.clone(), dims);
     let req = CompactionRequest {
         key,
         db_path,
@@ -604,7 +686,7 @@ fn queue_compaction(
 /// Record a write operation for compaction tracking.
 /// Call this after successful index_file or remove_file operations.
 fn record_compaction_operation(state: &mut DaemonState, db_path: &Path, dims: u32) {
-    let key = db_path.to_string_lossy().to_string();
+    let key = (db_path.to_path_buf(), dims);
     let entry = state
         .compaction
         .entry(key)
@@ -684,7 +766,7 @@ async fn shutdown_compaction(state: Arc<Mutex<DaemonState>>) {
     let start = Instant::now();
 
     // Collect databases that need compaction
-    let to_compact: Vec<(String, PathBuf, u32, u64)> = {
+    let to_compact: Vec<(CompactionKey, PathBuf, u32, u64)> = {
         let s = state.lock().await;
         s.compaction
             .iter()
@@ -796,8 +878,6 @@ fn storage_cache() -> &'static RwLock<HashMap<StorageKey, CachedStorage>> {
 // Populated lazily on first search, expires after 5 minutes.
 // ---------------------------------------------------------------------------
 
-use std::time::{Duration, Instant};
-
 fn env_duration_ms(key: &str, default: Duration) -> Duration {
     let Ok(value) = std::env::var(key) else {
         return default;
@@ -866,6 +946,7 @@ fn links_cache_path(root: &Path) -> PathBuf {
 
 /// Load links from the persisted cache file.
 /// Returns None if file doesn't exist, is invalid, or has wrong version.
+/// BLOCKING: Must run in spawn_blocking context.
 fn load_links_from_file(root: &Path) -> Option<Vec<Link>> {
     let cache_path = links_cache_path(root);
 
@@ -909,6 +990,7 @@ fn load_links_from_file(root: &Path) -> Option<Vec<Link>> {
 }
 
 /// Save discovered links to the cache file.
+/// BLOCKING: Must run in spawn_blocking context.
 fn save_links_to_file(root: &Path, links: &[Link]) -> Result<()> {
     let cache_path = links_cache_path(root);
 
@@ -950,10 +1032,11 @@ fn save_links_to_file(root: &Path, links: &[Link]) -> Result<()> {
 
 /// Invalidate the links cache file by deleting it.
 /// Called when symlinks or repo structure changes.
-pub fn invalidate_links_cache(root: &Path) {
+/// ASYNC: Uses tokio::fs internally.
+pub async fn invalidate_links_cache(root: &Path) {
     let cache_path = links_cache_path(root);
-    if cache_path.exists() {
-        if let Err(e) = std::fs::remove_file(&cache_path) {
+    if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
+        if let Err(e) = tokio::fs::remove_file(&cache_path).await {
             tracing::warn!("failed to invalidate links cache: {}", e);
         } else {
             tracing::info!("invalidated links cache for {}", root.to_string_lossy());
@@ -988,8 +1071,14 @@ fn should_invalidate_links_cache(path: &Path) -> bool {
     false
 }
 
-fn link_cache() -> &'static tokio::sync::RwLock<HashMap<PathBuf, Vec<Link>>> {
-    static CACHE: std::sync::OnceLock<tokio::sync::RwLock<HashMap<PathBuf, Vec<Link>>>> =
+/// Cached links with LRU tracking
+struct CachedLinks {
+    links: Vec<Link>,
+    last_access: Instant,
+}
+
+fn link_cache() -> &'static tokio::sync::RwLock<HashMap<PathBuf, CachedLinks>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::RwLock<HashMap<PathBuf, CachedLinks>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
@@ -1003,11 +1092,20 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
         Err(_) => return vec![],
     };
 
-    // Fast path: check in-memory cache
+    // Fast path: check in-memory cache and update access time
     match link_cache().try_read() {
-        Ok(cache) => {
-            if let Some(links) = cache.get(&root_path) {
-                return links.clone();
+        Ok(r) => {
+            if let Some(cached) = r.get(&root_path) {
+                let links = cached.links.clone();
+                drop(r);
+                
+                // Update last_access with write lock
+                if let Ok(mut w) = link_cache().try_write() {
+                    if let Some(entry) = w.get_mut(&root_path) {
+                        entry.last_access = Instant::now();
+                    }
+                }
+                return links;
             }
         }
         Err(_) => {
@@ -1018,6 +1116,7 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
     // TTL check: invalidate the file cache if it is older than the configured threshold.
     // Default: 1 hour. Override via OPENCODE_INDEXER_LINKS_CACHE_TTL_SECS env var.
     // This catches stale caches where new symlinks were added after the last save.
+    // BLOCKING: This function is called from spawn_blocking, std::fs is OK here.
     let ttl_secs: u64 = std::env::var("OPENCODE_INDEXER_LINKS_CACHE_TTL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1047,19 +1146,27 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
     // Medium path: try loading from file
     tracing::debug!("checking links cache file for {}", root_path.display());
     if let Some(links) = load_links_from_file(&root_path) {
-        // Update in-memory cache
+        // Update in-memory cache with LRU eviction
         if let Ok(mut cache) = link_cache().try_write() {
-            if cache.len() >= MAX_LINK_CACHE_SIZE {
-                let keys: Vec<_> = cache
-                    .keys()
-                    .take(MAX_LINK_CACHE_SIZE / 2)
-                    .cloned()
-                    .collect();
-                for k in keys {
-                    cache.remove(&k);
+            // LRU eviction: remove oldest entry if cache is full
+            if cache.len() >= MAX_LINK_CACHE_SIZE && !cache.contains_key(&root_path) {
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_access)
+                    .map(|(k, _)| k.clone())
+                {
+                    tracing::debug!(
+                        "link cache full ({}), evicting oldest entry: {}",
+                        MAX_LINK_CACHE_SIZE,
+                        oldest_key.display()
+                    );
+                    cache.remove(&oldest_key);
                 }
             }
-            cache.insert(root_path, links.clone());
+            cache.insert(root_path, CachedLinks {
+                links: links.clone(),
+                last_access: Instant::now(),
+            });
         }
         return links;
     }
@@ -1090,6 +1197,7 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
         .collect();
 
     // Save to file (best effort, don't fail if it errors)
+    // BLOCKING: This function is called from spawn_blocking, std::fs is OK here.
     tracing::info!(
         "saving {} links to file for {}",
         links.len(),
@@ -1104,20 +1212,28 @@ fn cached_discover_links(root: &str) -> Vec<Link> {
         );
     }
 
-    // Update in-memory cache
+    // Update in-memory cache with LRU eviction
     match link_cache().try_write() {
         Ok(mut cache) => {
-            if cache.len() >= MAX_LINK_CACHE_SIZE {
-                let keys: Vec<_> = cache
-                    .keys()
-                    .take(MAX_LINK_CACHE_SIZE / 2)
-                    .cloned()
-                    .collect();
-                for k in keys {
-                    cache.remove(&k);
+            // LRU eviction: remove oldest entry if cache is full
+            if cache.len() >= MAX_LINK_CACHE_SIZE && !cache.contains_key(&root_path) {
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_access)
+                    .map(|(k, _)| k.clone())
+                {
+                    tracing::debug!(
+                        "link cache full ({}), evicting oldest entry: {}",
+                        MAX_LINK_CACHE_SIZE,
+                        oldest_key.display()
+                    );
+                    cache.remove(&oldest_key);
                 }
             }
-            cache.insert(root_path, links.clone());
+            cache.insert(root_path, CachedLinks {
+                links: links.clone(),
+                last_access: Instant::now(),
+            });
         }
         Err(_) => {
             tracing::debug!("link cache contended on write, skipping in-memory cache update");
@@ -1813,12 +1929,7 @@ async fn handle_request(method: &str, params: &serde_json::Value) -> serde_json:
             let root = params["root"].as_str().unwrap_or(".");
             match PathBuf::from(root).canonicalize() {
                 Ok(root_path) => {
-                    let root_path_owned = root_path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        invalidate_links_cache(&root_path_owned);
-                    })
-                    .await
-                    .unwrap_or(());
+                    invalidate_links_cache(&root_path).await;
                     serde_json::json!({"success": true})
                 }
                 Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
@@ -2198,9 +2309,22 @@ async fn search_impl(
     }
 
     // Deduplicate by path (keep highest score)
+    // Sort by score descending so we keep the highest-scoring duplicate
     stage1_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut seen = HashSet::new();
-    stage1_results.retain(|(_, p, _)| seen.insert(p.clone()));
+    
+    // Dedup without allocating String clones - use indices instead
+    let mut seen_indices = HashSet::new();
+    stage1_results.retain(|(_, p, _)| {
+        // Hash the string slice directly without cloning
+        let hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            p.hash(&mut hasher);
+            hasher.finish()
+        };
+        seen_indices.insert(hash)
+    });
 
     // ========================================================================
     // STAGE 2: Global rerank for fair cross-project comparison
@@ -2267,7 +2391,7 @@ async fn search_single_db_stage1(
 
     // Vector search: get top 20 candidates
     let qvec = client.embed_query(query, embed_model, stored_dims).await?;
-    let results = storage.search_hybrid(query, &qvec, 20).await?;
+    let mut results = storage.search_hybrid(query, &qvec, 20).await?;
     if results.is_empty() {
         return Ok(Vec::new());
     }
@@ -2281,12 +2405,15 @@ async fn search_single_db_stage1(
     let mut ranked_results = Vec::new();
     for (idx, score) in ranked {
         if idx < results.len() {
+            // Move path when no prefix (avoids clone in common case)
             let p = if let Some(ref pre) = prefix {
                 format!("{}/{}", pre, results[idx].path)
             } else {
-                results[idx].path.clone()
+                std::mem::take(&mut results[idx].path)
             };
-            ranked_results.push((score.into(), p, results[idx].content.clone()));
+            // Move content to avoid clone
+            let c = std::mem::take(&mut results[idx].content);
+            ranked_results.push((score.into(), p, c));
         }
     }
 
@@ -2325,13 +2452,15 @@ async fn search_single_db_vector_only(
 
     let mut ranked_results = Vec::new();
     for r in results {
+        // Move path when no prefix (avoids clone in common case)
         let p = if let Some(ref pre) = prefix {
             format!("{}/{}", pre, r.path)
         } else {
-            r.path.clone()
+            r.path
         };
         // Use vector similarity score (already normalized 0-1)
-        ranked_results.push((r.score as f64, p, r.content.clone()));
+        // Move content to avoid clone
+        ranked_results.push((r.score as f64, p, r.content));
     }
 
     Ok(ranked_results)
@@ -2546,7 +2675,7 @@ async fn search_single_index(
     let (embed_model, rerank_model) = crate::cli::models_for_tier_pub(&stored_tier);
 
     let qvec = client.embed_query(query, embed_model, stored_dims).await?;
-    let results = storage.search_hybrid(query, &qvec, 20).await?;
+    let mut results = storage.search_hybrid(query, &qvec, 20).await?;
     if results.is_empty() {
         return Ok(Vec::new());
     }
@@ -2559,10 +2688,11 @@ async fn search_single_index(
     let mut out = Vec::new();
     for (idx, score) in ranked {
         if idx < results.len() {
+            // Move path and content to avoid clone
             out.push((
                 score.into(),
-                results[idx].path.clone(),
-                results[idx].content.clone(),
+                std::mem::take(&mut results[idx].path),
+                std::mem::take(&mut results[idx].content),
             ));
         }
     }
@@ -3742,7 +3872,7 @@ async fn start_memory_watcher(
                 pending,
                 failed_files: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 _shutdown_tx: shutdown_tx,
-                _started_at: Instant::now(),
+                started_at: Instant::now(),
                 _scope: scope.to_string(),
             },
         );
@@ -4551,15 +4681,23 @@ fn tui_connections_impl(state: &mut DaemonState, key: &str) -> serde_json::Value
 
 /// Canonicalize project key for consistent lookups (async with caching).
 async fn canonicalize_project_key(root: &str) -> String {
-    // Fast path: check cache
+    // Fast path: check cache and update access time
     {
-        let cache = canonicalized_paths_cache().read().await;
-        if let Some(cached) = cache.get(root) {
-            return cached.clone();
+        let r = canonicalized_paths_cache().read().await;
+        if let Some(cached) = r.get(root) {
+            let path = cached.path.clone();
+            drop(r);
+            
+            // Update last_access with write lock
+            let mut w = canonicalized_paths_cache().write().await;
+            if let Some(entry) = w.get_mut(root) {
+                entry.last_access = Instant::now();
+            }
+            return path;
         }
     }
 
-    // Slow path: async canonicalize and cache
+    // Slow path: async canonicalize and cache with LRU eviction
     let canonical = tokio::fs::canonicalize(root)
         .await
         .map(|p| p.to_string_lossy().to_string())
@@ -4567,17 +4705,27 @@ async fn canonicalize_project_key(root: &str) -> String {
 
     {
         let mut cache = canonicalized_paths_cache().write().await;
-        if cache.len() >= MAX_CANONICALIZED_CACHE_SIZE {
-            let keys: Vec<_> = cache
-                .keys()
-                .take(MAX_CANONICALIZED_CACHE_SIZE / 2)
-                .cloned()
-                .collect();
-            for k in keys {
-                cache.remove(&k);
+        
+        // LRU eviction: remove oldest entry if cache is full
+        if cache.len() >= MAX_CANONICALIZED_CACHE_SIZE && !cache.contains_key(root) {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(k, _)| k.clone())
+            {
+                tracing::debug!(
+                    "canonicalized path cache full ({}), evicting oldest entry: {}",
+                    MAX_CANONICALIZED_CACHE_SIZE,
+                    oldest_key
+                );
+                cache.remove(&oldest_key);
             }
         }
-        cache.insert(root.to_string(), canonical.clone());
+        
+        cache.insert(root.to_string(), CachedCanonicalPath {
+            path: canonical.clone(),
+            last_access: Instant::now(),
+        });
     }
 
     canonical
@@ -4598,9 +4746,13 @@ fn spawn_project_processor(key: String, state: Arc<Mutex<DaemonState>>) {
                     None => break,
                 };
                 match pq.queue.pop_front() {
-                    Some(item) => item,
+                    Some(item) => {
+                        pq.last_activity = Instant::now(); // Touch on dequeue
+                        item
+                    }
                     None => {
                         pq.processing = false;
+                        pq.last_activity = Instant::now(); // Touch on finish
                         break;
                     }
                 }
@@ -4811,7 +4963,9 @@ async fn dispatch_unified(
                 .or_insert_with(|| ProjectQueue {
                     queue: VecDeque::new(),
                     processing: false,
+                    last_activity: Instant::now(),
                 });
+            pq.last_activity = Instant::now(); // Touch on every operation
             pq.queue.push_back(QueueItem {
                 id: 0,
                 method: method.clone(),
@@ -4926,7 +5080,22 @@ async fn check_existing_daemon() -> Option<u16> {
 ///
 /// Pass `port = 0` to let the OS pick a free port; the actual port is
 /// written to `~/.opencode/indexer.port`.
-pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
+pub async fn run(port: u16, idle_shutdown_arg: Option<u64>, parent_pid_arg: Option<i32>) -> Result<()> {
+    // Initialize parent PID global if provided
+    if let Some(ppid) = parent_pid_arg {
+        parent_pid().set(Some(ppid)).ok();
+        tracing::info!("Will monitor parent PID {}", ppid);
+    } else {
+        // Try env var fallback
+        if let Ok(ppid_str) = std::env::var("OPENCODE_PARENT_PID") {
+            if let Ok(ppid) = ppid_str.parse::<i32>() {
+                parent_pid().set(Some(ppid)).ok();
+                tracing::info!("Will monitor parent PID {} (from env)", ppid);
+            }
+        } else {
+            parent_pid().set(None).ok();
+        }
+    }
     // --- Strict singleton enforcement via OS-level flock ---
     // Acquire an exclusive lock on ~/.opencode/indexer.lock.
     // This prevents TOCTOU races where two daemons start simultaneously.
@@ -4935,8 +5104,14 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
     let lock_dir = home.join(".opencode");
     tokio::fs::create_dir_all(&lock_dir).await.ok();
     let lock_path = lock_dir.join("indexer.lock");
-    let lock_file =
-        std::fs::File::create(&lock_path).context("failed to create indexer lock file")?;
+    
+    // Create lock file using tokio::fs, then convert to std::fs::File for flock
+    let lock_file = tokio::task::spawn_blocking({
+        let lock_path = lock_path.clone();
+        move || std::fs::File::create(&lock_path)
+    })
+    .await
+    .context("lock file creation task panicked")??;
 
     #[cfg(unix)]
     {
@@ -4994,6 +5169,12 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    
+    // Spawn parent monitor if parent_pid is set
+    if let Some(&Some(ppid)) = parent_pid().get() {
+        spawn_parent_monitor(ppid, shutdown_tx.clone()).await;
+    }
+    
     let state = Arc::new(Mutex::new(DaemonState {
         projects: HashMap::new(),
         shutdown: shutdown_tx,
@@ -5019,6 +5200,29 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
     {
         let mut s = state.lock().await;
         s.compaction_tx = Some(compaction_tx.clone());
+    }
+
+    // Spawn TTL cleanup task for unbounded HashMaps (projects, watchers, compaction)
+    {
+        let cleanup_state = state.clone();
+        let mut cleanup_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let mut s = cleanup_state.lock().await;
+                        s.cleanup_inactive();
+                    }
+                    _ = cleanup_shutdown.changed() => {
+                        if *cleanup_shutdown.borrow() {
+                            tracing::info!("TTL cleanup task shutting down");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // Start built-in memory watchers (global memories)
@@ -5206,8 +5410,8 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
 
             // Watch projects/ for orphan detection (deletions only) — create dir first if absent
             let projects = base.join("projects");
-            if !projects.exists() {
-                let _ = std::fs::create_dir_all(&projects);
+            if !tokio::fs::try_exists(&projects).await.unwrap_or(false) {
+                let _ = tokio::fs::create_dir_all(&projects).await;
             }
             if let Err(e) =
                 notify::Watcher::watch(&mut watcher, &projects, notify::RecursiveMode::NonRecursive)
@@ -5449,8 +5653,8 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
                     if should_invalidate {
                         if let Ok(root_path) = PathBuf::from(root.as_ref()).canonicalize() {
                             let root_path_owned = root_path.clone();
-                            tokio::task::spawn_blocking(move || {
-                                invalidate_links_cache(&root_path_owned);
+                            tokio::spawn(async move {
+                                invalidate_links_cache(&root_path_owned).await;
                             });
                         }
                     }
@@ -5829,13 +6033,14 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
                                 let mut ff = failed_files.lock().await;
                                 let count = ff.entry(file_path.clone()).or_insert(0);
                                 *count += 1;
-                                if *count >= 3 {
+                                if *count >= MAX_FILE_RETRIES {
                                     tracing::error!(
-                                        "memory file indexing failed after 3 attempts: {}",
+                                        "memory file indexing failed after {} attempts: {}",
+                                        MAX_FILE_RETRIES,
                                         rel_path
                                     );
-                                    drop(ff);
-                                    failed_files.lock().await.remove(&file_path);
+                                    // Remove while still holding the lock - no double-lock
+                                    ff.remove(&file_path);
                                 }
                             }
                         }
@@ -6033,8 +6238,10 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
                                 let mut ff = failed_files.lock().await;
                                 if let Some(count) = ff.get_mut(&file_path) {
                                     *count += 1;
-                                    if *count >= 3 {
-                                        tracing::error!("memory file indexing failed after 3 retry attempts: {}", rel_path);
+                                    if *count >= MAX_FILE_RETRIES {
+                                        tracing::error!("memory file indexing failed after {} retry attempts: {}", MAX_FILE_RETRIES, rel_path);
+                                        // Remove from failed_files to prevent unbounded growth
+                                        ff.remove(&file_path);
                                     }
                                 }
                             }
@@ -6077,7 +6284,7 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
 
                     // Remove compaction state entries that haven't been active in 24 hours
                     let now = Instant::now();
-                    let stale_keys: Vec<String> = s
+                    let stale_keys: Vec<CompactionKey> = s
                         .compaction
                         .iter()
                         .filter(|(_, cs)| {
@@ -6503,7 +6710,7 @@ mod compaction_tests {
         record_compaction_operation(&mut state, &db_path, 1024);
 
         assert_eq!(state.compaction.len(), 1);
-        let entry = state.compaction.get(db_path.to_str().unwrap()).unwrap();
+        let entry = state.compaction.get(&(db_path.clone(), 1024)).unwrap();
         assert_eq!(entry.operations_since_compact, 1);
         assert_eq!(entry.dimensions, 1024);
     }
@@ -6529,7 +6736,7 @@ mod compaction_tests {
         record_compaction_operation(&mut state, &db_path, 1024);
 
         assert_eq!(state.compaction.len(), 1);
-        let entry = state.compaction.get(db_path.to_str().unwrap()).unwrap();
+        let entry = state.compaction.get(&(db_path.clone(), 1024)).unwrap();
         assert_eq!(entry.operations_since_compact, 3);
     }
 
@@ -6560,15 +6767,15 @@ mod compaction_tests {
 
         assert_eq!(state.compaction.len(), 3);
 
-        let e1 = state.compaction.get(db1.to_str().unwrap()).unwrap();
+        let e1 = state.compaction.get(&(db1.clone(), 1024)).unwrap();
         assert_eq!(e1.operations_since_compact, 2);
         assert_eq!(e1.dimensions, 1024);
 
-        let e2 = state.compaction.get(db2.to_str().unwrap()).unwrap();
+        let e2 = state.compaction.get(&(db2.clone(), 512)).unwrap();
         assert_eq!(e2.operations_since_compact, 1);
         assert_eq!(e2.dimensions, 512);
 
-        let e3 = state.compaction.get(db3.to_str().unwrap()).unwrap();
+        let e3 = state.compaction.get(&(db3.clone(), 256)).unwrap();
         assert_eq!(e3.operations_since_compact, 3);
         assert_eq!(e3.dimensions, 256);
     }

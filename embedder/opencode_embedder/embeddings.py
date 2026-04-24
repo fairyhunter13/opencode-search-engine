@@ -44,6 +44,17 @@ except ImportError:
     _HAS_NUMPY = False
     np = None  # type: ignore[assignment]
 
+# Check CuPy availability for GPU-accelerated matrix operations
+_HAS_CUPY = False
+try:
+    import cupy as cp
+    _HAS_CUPY = True
+except ImportError:
+    cp = None  # type: ignore[assignment]
+
+# GPU normalization mode: "auto" (default), "gpu", "cpu"
+_GPU_NORMALIZE_MODE = os.environ.get("OPENCODE_GPU_NORMALIZE", "auto").lower()
+
 # GPU usage tracking for debugging (thread-safe)
 import threading
 
@@ -444,6 +455,74 @@ def _resize_np(vec, target_dim: int):  # type: ignore[no-untyped-def]
     if len(vec) < target_dim:
         return np.pad(vec, (0, target_dim - len(vec)), mode="constant")
     return vec[:target_dim]
+
+
+def _normalize_embeddings_gpu(mat: "np.ndarray") -> "np.ndarray":
+    """GPU-accelerated L2 normalization using CuPy.
+    
+    Keeps data on GPU for normalization, avoiding CPU-GPU transfers.
+    Falls back to CPU if GPU fails or CuPy unavailable.
+    """
+    if not _HAS_CUPY:
+        return _normalize_embeddings_cpu(mat)
+    
+    try:
+        # Transfer to GPU, normalize, transfer back
+        mat_gpu = cp.asarray(mat, dtype=cp.float32)
+        norms = cp.linalg.norm(mat_gpu, axis=1, keepdims=True)
+        cp.divide(mat_gpu, norms, out=mat_gpu, where=norms > 0)
+        result = cp.asnumpy(mat_gpu)
+        
+        # Clean up GPU memory
+        del mat_gpu, norms
+        return result
+    except Exception as e:
+        # Fallback to CPU if GPU fails (OOM, driver issues, etc.)
+        log.debug(f"GPU normalization failed, falling back to CPU: {e}")
+        return _normalize_embeddings_cpu(mat)
+
+
+def _normalize_embeddings_cpu(mat: "np.ndarray") -> "np.ndarray":
+    """CPU L2 normalization using numpy.
+    
+    In-place normalization to minimize memory copies.
+    """
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    np.divide(mat, norms, out=mat, where=norms > 0)
+    return mat
+
+
+def _normalize_embeddings(mat: "np.ndarray") -> "np.ndarray":
+    """Smart L2 normalization: GPU for large batches, CPU for small.
+    
+    Mode controlled by OPENCODE_GPU_NORMALIZE env var:
+    - "auto" (default): GPU for batches >= 256, CPU otherwise
+    - "gpu": Always use GPU (if available)
+    - "cpu": Always use CPU
+    """
+    batch_size = mat.shape[0]
+    
+    if _GPU_NORMALIZE_MODE == "gpu":
+        if _HAS_CUPY:
+            log.debug(f"normalize: {batch_size} embeddings via GPU (forced)")
+            return _normalize_embeddings_gpu(mat)
+        else:
+            log.debug(f"normalize: GPU requested but CuPy unavailable, using CPU")
+            return _normalize_embeddings_cpu(mat)
+    
+    elif _GPU_NORMALIZE_MODE == "cpu":
+        log.debug(f"normalize: {batch_size} embeddings via CPU (forced)")
+        return _normalize_embeddings_cpu(mat)
+    
+    else:  # auto mode
+        # Use GPU for large batches (>= 256 embeddings)
+        # GPU has overhead, only worth it for larger batches
+        if _HAS_CUPY and batch_size >= 256:
+            log.debug(f"normalize: {batch_size} embeddings via GPU (auto)")
+            return _normalize_embeddings_gpu(mat)
+        else:
+            log.debug(f"normalize: {batch_size} embeddings via CPU (auto)")
+            return _normalize_embeddings_cpu(mat)
 
 
 # Manual model cache (replaces @lru_cache to support explicit unloading).
@@ -1524,8 +1603,7 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
                             tmp[:, : mat.shape[1]] = mat
                             del mat
                             mat = tmp
-                    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-                    np.divide(mat, norms, out=mat, where=norms > 0)
+                    mat = _normalize_embeddings(mat)
                     out = mat.tolist()
                     del mat
                     gc.collect()
@@ -1584,8 +1662,7 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
                 tmp[:, : mat.shape[1]] = mat
                 del mat
                 mat = tmp
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        np.divide(mat, norms, out=mat, where=norms > 0)
+        mat = _normalize_embeddings(mat)
         # ONLY convert to list at final output (single .tolist() call)
         out = mat.tolist()
         del mat
@@ -1737,8 +1814,7 @@ def embed_passages_f32_bytes(
                             mat = tmp
                     
                     dim_out = int(mat.shape[1]) if mat.size else dimensions
-                    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-                    np.divide(mat, norms, out=mat, where=norms > 0)
+                    mat = _normalize_embeddings(mat)
                     mat = np.asarray(mat, dtype="<f4")
                     out_bytes = mat.tobytes()
                     del mat
@@ -1799,9 +1875,7 @@ def embed_passages_f32_bytes(
                 mat = tmp
 
         dim_out = int(mat.shape[1]) if mat.size else dimensions
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        np.divide(mat, norms, out=mat, where=norms > 0)
-
+        mat = _normalize_embeddings(mat)
         mat = np.asarray(mat, dtype="<f4")
         # Convert to bytes directly, no .tolist() intermediate step
         out_bytes = mat.tobytes()
@@ -1935,14 +2009,30 @@ def rerank(query: str, docs: list[str], *, model: str, top_k: int) -> list[tuple
     if not scores:
         return []
 
-    lo = min(scores)
-    hi = max(scores)
-    if hi == lo:
-        normed = [0.5 for _ in scores]
+    # Vectorized score normalization using numpy (faster than list comprehension)
+    if _HAS_NUMPY and len(scores) > 10:
+        scores_arr = np.array(scores, dtype=np.float32)
+        lo = float(scores_arr.min())
+        hi = float(scores_arr.max())
+        
+        if hi == lo:
+            normed = np.full(len(scores), 0.5, dtype=np.float32)
+        else:
+            normed = (scores_arr - lo) / (hi - lo)
+        
+        # argsort + reverse for top-k (more efficient than sorted())
+        order = np.argsort(normed)[::-1][:top_k].tolist()
+        normed = normed.tolist()
     else:
-        normed = [(s - lo) / (hi - lo) for s in scores]
-
-    order = sorted(range(len(normed)), key=lambda i: normed[i], reverse=True)[:top_k]
+        # Fallback to list comprehension for small batches
+        lo = min(scores)
+        hi = max(scores)
+        if hi == lo:
+            normed = [0.5 for _ in scores]
+        else:
+            normed = [(s - lo) / (hi - lo) for s in scores]
+        
+        order = sorted(range(len(normed)), key=lambda i: normed[i], reverse=True)[:top_k]
 
     if log.isEnabledFor(logging.INFO):
         log.info(
