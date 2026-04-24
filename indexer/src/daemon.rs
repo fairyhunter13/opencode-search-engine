@@ -6153,16 +6153,21 @@ pub async fn run(port: u16, idle_shutdown_arg: Option<u64>) -> Result<()> {
             _ = sighup.recv() => { "SIGHUP" }
             _ = async {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
                     let last_activity = {
                         let s = state_for_idle.lock().await;
                         *s.last_activity.read().await
                     };
                     let idle = last_activity.elapsed().as_secs();
+                    tracing::debug!("idle check: idle={}s, threshold={}s", idle, idle_shutdown_secs);
                     if idle >= idle_shutdown_secs {
                         tracing::info!("idle shutdown triggered (idle for {}s)", idle);
                         break;
                     }
+                    // Sleep until timeout or next check (30s intervals)
+                    let remaining = idle_shutdown_secs.saturating_sub(idle).max(1);
+                    let sleep_duration = std::cmp::min(remaining, 30);
+                    tracing::debug!("idle monitor sleeping for {}s", sleep_duration);
+                    tokio::time::sleep(Duration::from_secs(sleep_duration)).await;
                 }
             } => { "idle timeout" }
         }
