@@ -133,6 +133,103 @@ from opencode_embedder.embeddings import (
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Batch Request Coalescing
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass
+from typing import Callable, Coroutine
+
+@dataclass
+class _PendingEmbedRequest:
+    """A pending embedding request waiting for batch processing."""
+    texts: list[str]
+    future: asyncio.Future
+    start_idx: int
+
+class BatchCoalescer:
+    """
+    Coalesces multiple small embedding requests into larger GPU batches.
+    
+    Instead of processing each request individually with a semaphore,
+    this combines multiple concurrent requests into one large batch
+    for better GPU utilization.
+    
+    Environment variables:
+        OPENCODE_COALESCE_BATCH: Max texts per GPU batch (default: 384)
+        OPENCODE_COALESCE_WAIT_MS: Max wait before flush (default: 10ms)
+    """
+    
+    def __init__(
+        self,
+        process_fn: Callable[[list[str]], Coroutine[Any, Any, list]],
+        max_batch_size: int = 384,
+        max_wait_ms: float = 10.0,
+    ):
+        self._process_fn = process_fn
+        self._max_batch_size = max_batch_size
+        self._max_wait = max_wait_ms / 1000.0
+        self._pending: list[_PendingEmbedRequest] = []
+        self._lock = asyncio.Lock()
+        self._flush_task: asyncio.Task | None = None
+        self._total_texts = 0
+    
+    async def add(self, texts: list[str]) -> list:
+        """Add texts to pending batch. Returns results when processed."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        
+        async with self._lock:
+            req = _PendingEmbedRequest(
+                texts=texts,
+                future=future,
+                start_idx=self._total_texts,
+            )
+            self._pending.append(req)
+            self._total_texts += len(texts)
+            
+            # Flush immediately if batch full
+            if self._total_texts >= self._max_batch_size:
+                asyncio.create_task(self._flush())
+            # Otherwise schedule delayed flush
+            elif self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._delayed_flush())
+        
+        return await future
+    
+    async def _delayed_flush(self) -> None:
+        await asyncio.sleep(self._max_wait)
+        await self._flush()
+    
+    async def _flush(self) -> None:
+        async with self._lock:
+            if not self._pending:
+                return
+            requests = self._pending
+            self._pending = []
+            self._total_texts = 0
+        
+        # Combine all texts
+        all_texts: list[str] = []
+        for req in requests:
+            all_texts.extend(req.texts)
+        
+        try:
+            # Process entire batch at once on GPU
+            all_results = await self._process_fn(all_texts)
+            
+            # Distribute results back to original requests
+            for req in requests:
+                start = req.start_idx
+                end = start + len(req.texts)
+                if not req.future.done():
+                    req.future.set_result(all_results[start:end])
+        except Exception as e:
+            # Propagate error to all waiting requests
+            for req in requests:
+                if not req.future.done():
+                    req.future.set_exception(e)
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 OPENCODE_DIR = Path.home() / ".opencode"
@@ -302,6 +399,8 @@ class ModelServer:
         self._chunk_sem = asyncio.Semaphore(max(2, embed_workers))
         self._embed_workers = embed_workers
         self._idle_shutdown_secs = idle_shutdown_secs
+        # Batch coalescer for improved GPU throughput (initialized after warmup)
+        self._embed_coalescer: BatchCoalescer | None = None
 
     # ---- Idle shutdown monitor ----
 
@@ -330,6 +429,29 @@ class ModelServer:
                 break
 
         log.info("idle shutdown monitor stopped")
+
+    # ---- Parent process monitor ----
+
+    async def _parent_monitor(self, parent_pid: int) -> None:
+        """Monitor parent process and trigger shutdown if it dies."""
+        log.info("parent monitor started (parent_pid=%d)", parent_pid)
+
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.sleep(5)
+                # Check if parent process is alive using kill(pid, 0)
+                # Signal 0 doesn't send a signal, just checks if process exists
+                try:
+                    os.kill(parent_pid, 0)
+                except OSError:
+                    # Parent died
+                    log.warning("parent process %d died, initiating shutdown", parent_pid)
+                    self._shutdown.set()
+                    break
+            except asyncio.CancelledError:
+                break
+
+        log.info("parent monitor stopped")
 
     # ---- Method handlers ----
 
@@ -461,18 +583,32 @@ class ModelServer:
         dimensions = params.get("dimensions", 1024)
 
         t0 = time.monotonic()
-        async with self._embed_sem:
-            t_sem = time.monotonic()
-            vectors = await asyncio.to_thread(
-                embed_passages, texts, model=model, dimensions=dimensions
+        
+        # Use batch coalescer if available (better GPU throughput)
+        if self._embed_coalescer is not None:
+            # Note: coalescer uses default model/dimensions from environment
+            # Individual request params are ignored for now to maintain batch consistency
+            vectors = await self._embed_coalescer.add(texts)
+            t_done = time.monotonic()
+            log.debug(
+                "embed_passages (coalesced): %d texts, total_time=%.1fms",
+                len(texts),
+                (t_done - t0) * 1000,
             )
-        t_done = time.monotonic()
-        log.debug(
-            "embed_passages: %d texts, sem_wait=%.1fms, inference=%.1fms",
-            len(texts),
-            (t_sem - t0) * 1000,
-            (t_done - t_sem) * 1000,
-        )
+        else:
+            # Fallback to semaphore-based processing
+            async with self._embed_sem:
+                t_sem = time.monotonic()
+                vectors = await asyncio.to_thread(
+                    embed_passages, texts, model=model, dimensions=dimensions
+                )
+            t_done = time.monotonic()
+            log.debug(
+                "embed_passages: %d texts, sem_wait=%.1fms, inference=%.1fms",
+                len(texts),
+                (t_sem - t0) * 1000,
+                (t_done - t_sem) * 1000,
+            )
         return {"vectors": vectors}
 
     async def _handle_embed_passages_f32(self, params: dict) -> dict:
@@ -711,6 +847,9 @@ class ModelServer:
         # Log final GPU status after models are loaded
         # Use asyncio.to_thread for consistency with other sync helpers
         await asyncio.to_thread(self._log_gpu_status_after_warmup)
+        
+        # Initialize batch coalescer after warmup
+        await self._init_coalescer()
 
     def _log_gpu_status(self) -> None:
         """Log comprehensive GPU status at startup."""
@@ -825,6 +964,37 @@ class ModelServer:
             log.info("semantic chunker loaded (potion-base-32M)")
         except Exception as e:
             log.warning("failed to pre-warm semantic chunker: %s", e)
+    
+    async def _init_coalescer(self) -> None:
+        """Initialize batch coalescer for improved GPU throughput."""
+        max_batch = int(os.environ.get("OPENCODE_COALESCE_BATCH", "384"))
+        max_wait = float(os.environ.get("OPENCODE_COALESCE_WAIT_MS", "10"))
+        
+        async def process_batch(texts: list[str]) -> list:
+            """Process a batch of texts through the embedding pipeline."""
+            # Use default model and dimensions from environment or defaults
+            model = os.environ.get("OPENCODE_EMBED_MODEL", "")
+            dimensions = int(os.environ.get("OPENCODE_EMBED_DIMS", "1024"))
+            
+            # Run embedding in thread pool (ONNX releases GIL)
+            return await asyncio.to_thread(
+                embed_passages,
+                texts,
+                model=model,
+                dimensions=dimensions,
+            )
+        
+        self._embed_coalescer = BatchCoalescer(
+            process_fn=process_batch,
+            max_batch_size=max_batch,
+            max_wait_ms=max_wait,
+        )
+        
+        log.info(
+            "batch coalescer initialized (max_batch=%d, max_wait=%.1fms)",
+            max_batch,
+            max_wait,
+        )
 
     # ---- Lifecycle ----
 
@@ -834,6 +1004,16 @@ class ModelServer:
 
         # Start idle shutdown monitor (for on-demand spawning support)
         idle_monitor_task = asyncio.create_task(self._idle_shutdown_monitor())
+
+        # Start parent process monitor if OPENCODE_EMBEDDER_PARENT_PID is set
+        parent_monitor_task = None
+        parent_pid_str = os.environ.get("OPENCODE_EMBEDDER_PARENT_PID")
+        if parent_pid_str:
+            try:
+                parent_pid = int(parent_pid_str)
+                parent_monitor_task = asyncio.create_task(self._parent_monitor(parent_pid))
+            except ValueError:
+                log.warning("invalid OPENCODE_EMBEDDER_PARENT_PID: %s", parent_pid_str)
 
         # Start HTTP server (aiohttp, 127.0.0.1 only)
         http_runner = web.AppRunner(self._http_app())
@@ -879,6 +1059,8 @@ class ModelServer:
             log.info("shutting down model server")
             await http_runner.cleanup()
             idle_monitor_task.cancel()
+            if parent_monitor_task:
+                parent_monitor_task.cancel()
             cleanup_models()
             chunker.cleanup_chunkers()
             log.info("model server stopped")

@@ -12,5 +12,9 @@ pub mod discover;
 pub mod hardware;
 pub mod http_server;
 pub mod model_client;
+pub mod simd;
 pub mod storage;
 pub mod watcher;
+
+// Re-export SIMD functions for convenience
+pub use simd::{batch_cosine_similarity, cosine_similarity, rerank_by_cosine};

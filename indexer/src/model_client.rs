@@ -293,8 +293,12 @@ pub async fn ensure_embedder() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(DEFAULT_HTTP_PORT);
 
+    // Pass our PID to the embedder so it can monitor us
+    let our_pid = std::process::id();
+    
     match std::process::Command::new(&binary)
         .env("OPENCODE_EMBED_HTTP_PORT", port.to_string())
+        .env("OPENCODE_EMBEDDER_PARENT_PID", our_pid.to_string())
         // Cap thread counts in the embedder subprocess to reduce CPU pressure.
         .env("OMP_NUM_THREADS", "2")
         .env("MKL_NUM_THREADS", "2")

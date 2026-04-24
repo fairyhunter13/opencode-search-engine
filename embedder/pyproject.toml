@@ -40,6 +40,13 @@ dev = [
 build = [
     "pyinstaller>=6.0.0",
 ]
+gpu = [
+    # GPU-accelerated matrix operations (L2 normalization, etc.)
+    # Install with: pip install -e ".[gpu]"
+    # Requires CUDA toolkit installed on system
+    "cupy-cuda12x>=13.0.0",  # For CUDA 12.x (most common)
+    # For CUDA 11.x, use: cupy-cuda11x>=13.0.0
+]
 
 [project.scripts]
 opencode-model-server = "opencode_embedder.server:run_server"
