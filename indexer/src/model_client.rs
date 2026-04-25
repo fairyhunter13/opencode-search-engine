@@ -6,6 +6,7 @@
 //! The daemon will auto-start the embedder if it's not already running.
 
 use std::future::Future;
+use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -19,9 +20,13 @@ use serde_json::json;
 /// We use 16384 as a generous upper bound to accommodate future models.
 const MAX_EMBEDDING_DIM: usize = 16384;
 
-// RPC timeout: embeddings typically complete in <2s, chunking in <1s.
-// 60s gives headroom for large batches while catching true hangs.
-const RPC_TIMEOUT: Duration = Duration::from_secs(120);
+// Per-operation timeouts — sized to typical completion times with headroom.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+const EMBED_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_AND_EMBED_TIMEOUT: Duration = Duration::from_secs(90);
+const RERANK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default HTTP port for the Python embedder's HTTP API.
 pub const DEFAULT_HTTP_PORT: u16 = 9998;
@@ -199,7 +204,6 @@ fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(RPC_TIMEOUT)
             .build()
             .expect("failed to build HTTP client")
     })
@@ -218,6 +222,20 @@ static EMBEDDER_LAST_USED: AtomicU64 = AtomicU64::new(0);
 
 /// Guard: idle-shutdown background task spawned at most once.
 static IDLE_MONITOR_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// In-flight request limiter to prevent overwhelming the embedder.
+static INFLIGHT_SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+fn inflight_semaphore() -> &'static tokio::sync::Semaphore {
+    INFLIGHT_SEM.get_or_init(|| {
+        let limit = std::env::var("OPENCODE_INDEXER_INFLIGHT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8);
+        tracing::info!("in-flight request limit: {}", limit);
+        tokio::sync::Semaphore::new(limit)
+    })
+}
 
 /// Child handle for the embedder process we spawned (None = not spawned by us).
 static EMBEDDER_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
@@ -302,8 +320,8 @@ pub async fn ensure_embedder() {
     // Pass our PID to the embedder so it can monitor us
     let our_pid = std::process::id();
     
-    match std::process::Command::new(&binary)
-        .env("OPENCODE_EMBED_HTTP_PORT", port.to_string())
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.env("OPENCODE_EMBED_HTTP_PORT", port.to_string())
         .env("OPENCODE_EMBEDDER_PARENT_PID", our_pid.to_string())
         // Cap thread counts in the embedder subprocess to reduce CPU pressure.
         .env("OMP_NUM_THREADS", "2")
@@ -313,8 +331,24 @@ pub async fn ensure_embedder() {
         .env("TOKENIZERS_PARALLELISM", "false")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+
+    // REC-5+6: Set resource limits and priority on embedder child process.
+    // - RLIMIT_AS=20GB prevents runaway memory allocation
+    // - nice(10) matches parent indexer's CPU priority
+    // - ioprio idle class prevents I/O starvation of interactive processes
+    unsafe {
+        cmd.pre_exec(|| {
+            let mem_limit: u64 = 20 * 1024 * 1024 * 1024;
+            let rl = libc::rlimit { rlim_cur: mem_limit, rlim_max: mem_limit };
+            libc::setrlimit(libc::RLIMIT_AS, &rl);
+            libc::nice(10);
+            libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, (3i64 << 13) | 7);
+            Ok(())
+        });
+    }
+
+    match cmd.spawn()
     {
         Ok(child) => {
             let pid = child.id();
@@ -469,11 +503,20 @@ fn is_retryable_error(e: &anyhow::Error) -> bool {
     false
 }
 
-/// Wrap an async HTTP operation with embedder restart recovery.
-///
-/// If the first attempt fails with a connection error the embedder is reset,
-/// `ensure_embedder` is called again, and the operation is retried up to
-/// `MAX_RETRIES` times.  Any other error is returned immediately.
+/// Return `true` when `e` indicates the embedder is overloaded (HTTP 503/429)
+/// but still alive — these should trigger backoff, not a process restart.
+fn is_overloaded_error(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(req) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = req.status() {
+                return status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+            }
+        }
+    }
+    false
+}
+
 /// Record current time as last embed usage (unix millis).
 fn touch_last_used() {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -490,13 +533,40 @@ where
     Fut: Future<Output = Result<T>>,
 {
     const MAX_RETRIES: u32 = 2;
+    const MAX_BACKOFF_RETRIES: u32 = 3;
+
+    // REC-1: Acquire in-flight permit to cap concurrent requests
+    let t_wait = tokio::time::Instant::now();
+    let _permit = inflight_semaphore()
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("in-flight semaphore closed"))?;
+
+    // REC-10: Log if we waited a long time for a permit
+    let wait_ms = t_wait.elapsed().as_millis();
+    if wait_ms > 2000 {
+        tracing::warn!("embed semaphore wait={:.1}s (server may be overloaded)", wait_ms as f64 / 1000.0);
+    }
+
     let mut failures = 0u32;
+    let mut backoff_failures = 0u32;
     loop {
         match op().await {
             Ok(v) => {
                 touch_last_used();
                 return Ok(v);
             }
+            // REC-2: Backoff on 503/429 — embedder alive but busy
+            Err(e) if backoff_failures < MAX_BACKOFF_RETRIES && is_overloaded_error(&e) => {
+                backoff_failures += 1;
+                let delay = Duration::from_millis(500 * 2u64.pow(backoff_failures - 1));
+                tracing::warn!(
+                    "embedder overloaded (503/429), backing off {}ms (attempt {})",
+                    delay.as_millis(), backoff_failures
+                );
+                tokio::time::sleep(delay).await;
+            }
+            // Connection refused — embedder process likely died
             Err(e) if failures < MAX_RETRIES && is_retryable_error(&e) => {
                 failures += 1;
                 tracing::warn!(
@@ -511,6 +581,7 @@ where
         }
     }
 }
+
 
 /// Decode a standard-base64 string into raw bytes.
 fn b64_decode(s: &str) -> Result<Vec<u8>> {
@@ -592,6 +663,7 @@ struct HttpRerankResp {
 pub async fn http_health() -> Result<bool> {
     let resp = http_client()
         .get(format!("{}/health", http_base_url()))
+        .timeout(HEALTH_TIMEOUT)
         .send()
         .await
         .context("HTTP health check failed")?;
@@ -602,6 +674,7 @@ async fn http_embed_passages_inner(texts: &[String], model: &str, dimensions: u3
     let wrapper: HttpResultWrapper<HttpPassagesF32Resp> = http_client()
         .post(format!("{}/embed/passages_f32", http_base_url()))
         .json(&json!({"passages": texts, "model": model, "dimensions": dimensions}))
+        .timeout(EMBED_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/passages_f32 request failed")?
@@ -634,6 +707,7 @@ async fn http_embed_query_inner(text: &str, model: &str, dimensions: u32) -> Res
     let wrapper: HttpResultWrapper<HttpQueryF32Resp> = http_client()
         .post(format!("{}/embed/query_f32", http_base_url()))
         .json(&json!({"query": text, "model": model, "dimensions": dimensions}))
+        .timeout(QUERY_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/query_f32 request failed")?
@@ -660,6 +734,7 @@ async fn http_chunk_inner(content: &str, path: &str, tier: &str) -> Result<Vec<C
     let wrapper: HttpResultWrapper<HttpChunkResp> = http_client()
         .post(format!("{}/embed/chunk", http_base_url()))
         .json(&json!({"content": content, "path": path, "tier": tier}))
+        .timeout(CHUNK_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/chunk request failed")?
@@ -686,6 +761,7 @@ async fn http_chunk_file_inner(file: &str, path: &str, tier: &str) -> Result<Vec
     let wrapper: HttpResultWrapper<HttpChunkResp> = http_client()
         .post(format!("{}/embed/chunk_file", http_base_url()))
         .json(&json!({"path": file, "display_path": path, "tier": tier}))
+        .timeout(CHUNK_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/chunk_file request failed")?
@@ -724,6 +800,7 @@ async fn http_chunk_and_embed_inner(
             "model": model,
             "dimensions": dimensions,
         }))
+        .timeout(CHUNK_AND_EMBED_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/chunk_and_embed request failed")?
@@ -782,6 +859,7 @@ async fn http_chunk_and_embed_file_inner(
             "model": model,
             "dimensions": dimensions,
         }))
+        .timeout(CHUNK_AND_EMBED_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/chunk_and_embed (file) request failed")?
@@ -828,6 +906,7 @@ async fn http_rerank_inner(query: &str, docs: &[&str], model: &str, top_k: u32) 
     let wrapper: HttpResultWrapper<HttpRerankResp> = http_client()
         .post(format!("{}/embed/rerank", http_base_url()))
         .json(&json!({"query": query, "passages": docs, "model": model, "top_k": top_k}))
+        .timeout(RERANK_TIMEOUT)
         .send()
         .await
         .context("HTTP embed/rerank request failed")?
