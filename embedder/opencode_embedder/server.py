@@ -969,20 +969,23 @@ class ModelServer:
         """Initialize batch coalescer for improved GPU throughput."""
         max_batch = int(os.environ.get("OPENCODE_COALESCE_BATCH", "384"))
         max_wait = float(os.environ.get("OPENCODE_COALESCE_WAIT_MS", "10"))
-        
+        embed_sem = self._embed_sem  # capture for closure
+
         async def process_batch(texts: list[str]) -> list:
             """Process a batch of texts through the embedding pipeline."""
             # Use default model and dimensions from environment or defaults
             model = os.environ.get("OPENCODE_EMBED_MODEL", "")
             dimensions = int(os.environ.get("OPENCODE_EMBED_DIMS", "1024"))
-            
-            # Run embedding in thread pool (ONNX releases GIL)
-            return await asyncio.to_thread(
-                embed_passages,
-                texts,
-                model=model,
-                dimensions=dimensions,
-            )
+
+            # Acquire embed semaphore to respect GPU concurrency limits
+            async with embed_sem:
+                # Run embedding in thread pool (ONNX releases GIL)
+                return await asyncio.to_thread(
+                    embed_passages,
+                    texts,
+                    model=model,
+                    dimensions=dimensions,
+                )
         
         self._embed_coalescer = BatchCoalescer(
             process_fn=process_batch,
@@ -1216,7 +1219,7 @@ def run_server(
         loop.run_until_complete(srv.serve())
     finally:
         # Clean up thread pool executor
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=True)
         loop.close()
         # Ensure all child processes are cleaned up
         _kill_process_group()
