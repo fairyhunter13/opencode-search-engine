@@ -391,6 +391,7 @@ class ModelServer:
     ) -> None:
         self._shutdown = asyncio.Event()
         self._last_activity = time.monotonic()
+        self._start_time = time.monotonic()
         self._embed_sem = asyncio.Semaphore(embed_workers)
         # Limit concurrent chunking to avoid CPU oversubscription.
         # Chunking is CPU-intensive (tree-sitter + tokenizers) and each thread
@@ -401,6 +402,9 @@ class ModelServer:
         self._idle_shutdown_secs = idle_shutdown_secs
         # Batch coalescer for improved GPU throughput (initialized after warmup)
         self._embed_coalescer: BatchCoalescer | None = None
+        # REC-3: Active request counter for circuit breaker
+        self._active_requests = 0
+        self._max_active_requests = int(os.environ.get("OPENCODE_EMBED_MAX_ACTIVE", "32"))
 
     # ---- Idle shutdown monitor ----
 
@@ -652,10 +656,7 @@ class ModelServer:
         return {"results": [{"index": idx, "score": score} for idx, score in ranked]}
 
     def _handle_health(self) -> dict:
-        """Health check — returns server status with GPU info.
-
-        Reports 'degraded' status when GPU was expected but ONNX fell back to CPU.
-        """
+        """Health check — returns server status with GPU info and operational metrics."""
         gpu_stats = get_gpu_stats()
         is_degraded = gpu_stats.get("degraded", False)
         result = {
@@ -668,10 +669,28 @@ class ModelServer:
                 "gpu_ops": gpu_stats["gpu_ops"],
                 "cpu_ops": gpu_stats["cpu_ops"],
             },
+            "metrics": {
+                "active_requests": self._active_requests,
+                "max_active_requests": self._max_active_requests,
+                "embed_sem_free": self._embed_sem._value if hasattr(self._embed_sem, '_value') else -1,
+                "embed_sem_total": self._embed_workers,
+                "uptime_secs": int(time.monotonic() - self._start_time),
+            },
         }
         if is_degraded:
             result["gpu"]["degraded"] = True
             result["gpu"]["degraded_reason"] = gpu_stats.get("degraded_reason", "")
+        # Add VRAM metrics if available
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            result["metrics"]["vram_used_mb"] = mem_info.used // (1024 * 1024)
+            result["metrics"]["vram_total_mb"] = mem_info.total // (1024 * 1024)
+            result["metrics"]["vram_pct"] = round(mem_info.used / mem_info.total * 100, 1)
+        except Exception:
+            pass  # pynvml not available or no NVIDIA GPU
         return result
 
     def _handle_shutdown(self) -> dict:
@@ -789,6 +808,27 @@ class ModelServer:
         timeout_secs = int(os.environ.get("OPENCODE_EMBED_REQUEST_TIMEOUT", "120"))
 
         @web.middleware
+        async def circuit_breaker(request: web.Request, handler):
+            """REC-3: Reject requests when server is overloaded."""
+            # Health checks always pass through
+            if request.path == "/health":
+                return await handler(request)
+            if self._active_requests >= self._max_active_requests:
+                log.warning(
+                    "circuit breaker: rejecting request (%d/%d active)",
+                    self._active_requests, self._max_active_requests,
+                )
+                return web.json_response(
+                    {"error": "server overloaded", "active": self._active_requests},
+                    status=503,
+                )
+            self._active_requests += 1
+            try:
+                return await handler(request)
+            finally:
+                self._active_requests -= 1
+
+        @web.middleware
         async def timeout_middleware(request: web.Request, handler):
             self._last_activity = time.monotonic()
             try:
@@ -800,7 +840,7 @@ class ModelServer:
                     status=504
                 )
 
-        app = web.Application(middlewares=[timeout_middleware])
+        app = web.Application(middlewares=[circuit_breaker, timeout_middleware])
         app.router.add_get("/health", self._http_health)
         app.router.add_post("/shutdown", self._http_shutdown)
         app.router.add_post("/embed/passages", self._http_embed_passages)
@@ -999,6 +1039,56 @@ class ModelServer:
             max_wait,
         )
 
+    # ---- VRAM watchdog ----
+
+    async def _vram_watchdog(self) -> None:
+        """REC-8: Auto-throttle embed concurrency based on VRAM pressure.
+
+        When VRAM usage exceeds 90%, temporarily reduce embed semaphore
+        to prevent OOM. When VRAM drops below 70%, restore full capacity.
+        """
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            log.info("VRAM watchdog: pynvml not available, disabled")
+            return
+
+        throttled = False
+        check_interval = 30  # seconds
+        high_threshold = 0.90
+        low_threshold = 0.70
+
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.sleep(check_interval)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                vram_pct = mem_info.used / mem_info.total
+
+                if vram_pct >= high_threshold and not throttled:
+                    # Drain one semaphore slot to reduce concurrent GPU work
+                    try:
+                        # Use wait_for to avoid blocking indefinitely
+                        await asyncio.wait_for(self._embed_sem.acquire(), timeout=1.0)
+                        throttled = True
+                        log.warning(
+                            "VRAM watchdog: pressure %.1f%% >= %.0f%%, throttled embed concurrency",
+                            vram_pct * 100, high_threshold * 100,
+                        )
+                    except asyncio.TimeoutError:
+                        pass  # Couldn't acquire, all slots busy
+                elif vram_pct < low_threshold and throttled:
+                    self._embed_sem.release()
+                    throttled = False
+                    log.info(
+                        "VRAM watchdog: pressure %.1f%% < %.0f%%, restored embed concurrency",
+                        vram_pct * 100, low_threshold * 100,
+                    )
+            except Exception as e:
+                log.debug("VRAM watchdog error: %s", e)
+                await asyncio.sleep(check_interval)
+
     # ---- Lifecycle ----
 
     async def serve(self) -> None:
@@ -1007,6 +1097,9 @@ class ModelServer:
 
         # Start idle shutdown monitor (for on-demand spawning support)
         idle_monitor_task = asyncio.create_task(self._idle_shutdown_monitor())
+
+        # REC-8: Start VRAM pressure watchdog
+        vram_watchdog_task = asyncio.create_task(self._vram_watchdog())
 
         # Start parent process monitor if OPENCODE_EMBEDDER_PARENT_PID is set
         parent_monitor_task = None
@@ -1062,6 +1155,7 @@ class ModelServer:
             log.info("shutting down model server")
             await http_runner.cleanup()
             idle_monitor_task.cancel()
+            vram_watchdog_task.cancel()
             if parent_monitor_task:
                 parent_monitor_task.cancel()
             cleanup_models()
