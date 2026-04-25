@@ -219,6 +219,9 @@ static EMBEDDER_LAST_USED: AtomicU64 = AtomicU64::new(0);
 /// Guard: idle-shutdown background task spawned at most once.
 static IDLE_MONITOR_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+/// Child handle for the embedder process we spawned (None = not spawned by us).
+static EMBEDDER_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
 /// Port file path for the embedder PID.
 fn embedder_pid_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".opencode").join("embedder.pid"))
@@ -266,9 +269,12 @@ pub async fn ensure_embedder() {
                     }
                     // Still not healthy after waiting, kill and respawn
                     tracing::warn!("embedder PID {} not healthy after 30s, killing", pid);
+                    // Kill the stale external process directly (not our child)
                     unsafe { libc::kill(pid as i32, libc::SIGTERM); }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                    // Also reap our own child if any
+                    reap_embedder_child();
                 }
                 // Remove stale PID file
                 let _ = tokio::fs::remove_file(&pid_path).await;
@@ -313,6 +319,7 @@ pub async fn ensure_embedder() {
         Ok(child) => {
             let pid = child.id();
             EMBEDDER_PID.store(pid, Ordering::Relaxed);
+            *EMBEDDER_CHILD.lock().unwrap() = Some(child);
             tracing::info!("embedder spawned with PID {}", pid);
 
             // Write PID file
@@ -328,9 +335,7 @@ pub async fn ensure_embedder() {
                 spawn_idle_monitor();
             } else {
                 tracing::error!("embedder failed to become healthy after 90s, killing and resetting");
-                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                reap_embedder_child();
                 if let Some(pid_path) = embedder_pid_path() {
                     let _ = tokio::fs::remove_file(&pid_path).await;
                 }
@@ -398,6 +403,33 @@ fn spawn_idle_monitor() {
     });
 }
 
+/// Kill the embedder child process and wait for it to be reaped (no zombies).
+fn reap_embedder_child() {
+    let pid = EMBEDDER_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        // Give it a moment to exit gracefully
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if let Ok(mut guard) = EMBEDDER_CHILD.lock() {
+        if let Some(ref mut child) = *guard {
+            match child.try_wait() {
+                Ok(Some(_)) => {} // already exited
+                Ok(None) => {
+                    // Still running, force kill and wait
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        *guard = None;
+    }
+}
+
 /// Shut down the embedder if we spawned it.
 pub fn shutdown_embedder() {
     let pid = EMBEDDER_PID.load(Ordering::Relaxed);
@@ -405,9 +437,7 @@ pub fn shutdown_embedder() {
         return;
     }
     tracing::info!("shutting down embedder PID {}", pid);
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
+    reap_embedder_child();
     // Clean up PID file
     if let Some(pid_path) = embedder_pid_path() {
         let _ = std::fs::remove_file(&pid_path);
@@ -424,21 +454,15 @@ fn reset_embedder() {
     EMBEDDER_PID.store(0, Ordering::SeqCst);
 }
 
-/// Return `true` when `e` is a connection-level failure that likely means the
-/// embedder process died (ECONNREFUSED, connection reset, or timeout).
+/// Return `true` only for connection-level failures that indicate the embedder
+/// process died (ECONNREFUSED, connection reset).  Timeouts and HTTP 5xx are
+/// NOT retryable — the embedder is alive but overloaded, and killing it would
+/// make things worse (model reload storm).
 fn is_retryable_error(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
         if let Some(req) = cause.downcast_ref::<reqwest::Error>() {
-            if req.is_connect() || req.is_timeout() {
+            if req.is_connect() {
                 return true;
-            }
-            // Retry on server errors (5xx) — the embedder may still be loading models
-            if req.is_status() {
-                if let Some(status) = req.status() {
-                    if status.is_server_error() {
-                        return true;
-                    }
-                }
             }
         }
     }
@@ -850,8 +874,15 @@ pub struct ChunkWithVector {
 // ============================================================================
 
 /// Returns recommended concurrency for HTTP embedding workloads.
+///
+/// Defaults to 4 — high enough for pipeline overlap but low enough to avoid
+/// overwhelming the Python embedder's semaphore-gated embed workers.
+/// Override with `OPENCODE_INDEXER_EMBED_CONCURRENCY`.
 pub fn recommended_concurrency() -> usize {
-    16
+    std::env::var("OPENCODE_INDEXER_EMBED_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
 }
 
 /// Returns true when running against a remote (non-local) embedding server.
@@ -1341,7 +1372,7 @@ Content-Length: 0
         let resp = client.get(format!("http://{addr}")).send().await.unwrap();
         let err = resp.error_for_status().unwrap_err();
         let anyhow_err: anyhow::Error = err.into();
-        assert!(is_retryable_error(&anyhow_err), "should detect HTTP 500 server error");
+        assert!(!is_retryable_error(&anyhow_err), "HTTP 500 should NOT be retryable — embedder is alive but overloaded");
         server.await.unwrap();
     }
 

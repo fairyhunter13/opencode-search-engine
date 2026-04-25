@@ -1584,14 +1584,11 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
                         # IOBinding failed, fall back to standard path
                         use_iobinding = False
                         break
-                    
-                    gc.collect()
                 
                 if use_iobinding and all_items:
                     # Success! Process the GPU results
                     mat = np.concatenate(all_items, axis=0) if len(all_items) > 1 else all_items[0]
                     del all_items
-                    gc.collect()
                     
                     if mat.ndim == 1:
                         mat = mat.reshape(1, -1)
@@ -1642,15 +1639,12 @@ def embed_passages(texts: list[str], *, model: str, dimensions: int) -> list[lis
             all_items.extend(list(items))
         t_embed_done = time.perf_counter()
         t_embed_total += t_embed_done - t_embed_start
-        # Aggressive GC after each batch to free GPU-to-CPU transfer buffers
-        gc.collect()
 
     # Single-pass vectorized normalize across the full result matrix
     if _HAS_NUMPY and all_items:
         # Concatenate all batches once (avoid repeated extend copies)
         mat = np.concatenate(all_items, axis=0) if len(all_items) > 1 else all_items[0]
         del all_items  # Free batch list immediately
-        gc.collect()
         
         if mat.ndim == 1:
             mat = mat.reshape(1, -1)
