@@ -58,7 +58,7 @@ def astro(http):
     match = next((p for p in projects if p.get("path") == _ASTRO_PATH), None)
     assert match is not None, f"astro-project not in registry: {_ASTRO_PATH}"
     assert match.get("communities", 0) > 0, (
-        "astro-project has no communities — run build(action='pipeline') first"
+        "astro-project has no communities — run index(enabled=True) [daemon auto-builds KB] first"
     )
     return _ASTRO_PATH
 
@@ -73,7 +73,7 @@ def project(http):
     r = http.get("/api/projects")
     projects = r.json().get("projects", [])
     all_indexed = [p for p in projects if p.get("communities", 0) > 0]
-    assert all_indexed, "No indexed project with communities — run build(action='pipeline') first"
+    assert all_indexed, "No indexed project with communities — run index(enabled=True) [daemon auto-builds KB] first"
     # Prefer astro-project as canonical test target
     astro_match = next((p for p in all_indexed if p.get("path") == _ASTRO_PATH), None)
     if astro_match:
@@ -106,7 +106,7 @@ def quality_project(http):
     r = http.get("/api/projects")
     projects = r.json().get("projects", [])
     matches = [p["path"] for p in projects if p.get("path", "").endswith("opencode-search-engine")]
-    assert matches, "opencode-search-engine not in registry — run build(action='pipeline') first"
+    assert matches, "opencode-search-engine not in registry — run index(enabled=True) [daemon auto-builds KB] first"
     return matches[0]
 
 
